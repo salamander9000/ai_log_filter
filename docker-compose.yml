@@ -1,0 +1,99 @@
+version: "3.8"
+
+services:
+  # --- OpenSearch for storing analyzed logs ---
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin_12345!
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - plugins.security.disabled=true          # PoC only - no TLS hassle
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - lognet
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # --- OpenSearch Dashboards for visualization ---
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.18.0
+    container_name: opensearch-dashboards
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true   # match disabled security above
+    ports:
+      - "5601:5601"
+    networks:
+      - lognet
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  # --- Ollama for local LLM inference (CPU only) ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - lognet
+    # No GPU - pure CPU inference
+    # Model will be pulled on first run by the AI service
+
+  # --- Synthetic syslog generator (for testing) ---
+  log-generator:
+    build:
+      context: ./sample-logs
+      dockerfile: Dockerfile
+    container_name: log-generator
+    volumes:
+      - shared-logs:/var/log/synthetic
+    networks:
+      - lognet
+
+  # --- The AI log analysis service ---
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: ai-log-service
+    environment:
+      - OPENSEARCH_HOST=http://opensearch:9200
+      - OLLAMA_HOST=http://ollama:11434
+      - LOG_FILE=/var/log/synthetic/syslog
+      - LLM_MODEL=qwen2.5:3b
+      - LLM_ENABLED=true
+      - ANOMALY_THRESHOLD=-0.15
+      - TRAINING_WINDOW=500
+      - BATCH_SIZE=50
+    volumes:
+      - shared-logs:/var/log/synthetic:ro
+    networks:
+      - lognet
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      log-generator:
+        condition: service_started
+
+volumes:
+  opensearch-data:
+  ollama-models:
+  shared-logs:
+
+networks:
+  lognet:
+    driver: bridge
