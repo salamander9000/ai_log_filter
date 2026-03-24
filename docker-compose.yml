@@ -137,8 +137,9 @@ services:
       - LLM_ENABLED=true
       - LLM_WORKERS=1
       - LLM_QUEUE_SIZE=1000
-      - "ANOMALY_THRESHOLD=-0.15"
-      - TRAINING_WINDOW=200
+      - "ANOMALY_THRESHOLD=-0.3"
+      - TRAINING_WINDOW=1000
+      - CONTAMINATION=0.02
       - BATCH_SIZE=50
     volumes:
       - shared-logs:/var/log/synthetic:ro

@@ -168,7 +168,7 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
         "columns": ["@timestamp", "hostname", "process", "llm_threat_category", "llm_severity", "llm_explanation", "anomaly_score", "llm_recommended_action", "message"],
         "sort": [["@timestamp", "desc"]],
         "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"llm_analyzed:true\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"
+            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"llm_analyzed:true AND NOT llm_threat_category:benign_anomaly\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"
         }
     }
 }

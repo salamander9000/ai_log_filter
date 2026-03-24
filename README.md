@@ -182,8 +182,9 @@ All configuration is via environment variables in `docker-compose.yml` or `.env`
 | `OLLAMA_HOST` | `http://ollama:11434` | Ollama endpoint |
 | `LLM_MODEL` | `qwen2.5:3b` | Ollama model name |
 | `LLM_ENABLED` | `true` | Enable/disable LLM analysis |
-| `ANOMALY_THRESHOLD` | `-0.15` | Isolation Forest anomaly threshold (more negative = stricter) |
-| `TRAINING_WINDOW` | `200` | Number of events before first model training |
+| `ANOMALY_THRESHOLD` | `-0.3` | Isolation Forest anomaly threshold (more negative = stricter) |
+| `TRAINING_WINDOW` | `1000` | Number of events before first model training |
+| `CONTAMINATION` | `0.02` | Expected fraction of anomalies in the data (0.02 = 2%) |
 | `BATCH_SIZE` | `50` | OpenSearch bulk indexing batch size |
 
 ### Log Generator (demo mode only)
@@ -247,8 +248,8 @@ docker compose down -v
 
 ## Tuning Tips
 
-- **Too many false positives?** Lower `ANOMALY_THRESHOLD` (e.g., `-0.3`). Increase `TRAINING_WINDOW`.
-- **Missing real anomalies?** Raise `ANOMALY_THRESHOLD` (e.g., `-0.05`).
+- **Too many false positives?** Lower `ANOMALY_THRESHOLD` (e.g., `-0.4`). Increase `TRAINING_WINDOW`. Lower `CONTAMINATION` (e.g., `0.01`).
+- **Missing real anomalies?** Raise `ANOMALY_THRESHOLD` (e.g., `-0.15`). Raise `CONTAMINATION` (e.g., `0.05`).
 - **LLM too slow?** Try `qwen2.5:1.5b` for faster inference, or set `LLM_ENABLED=false` to run ML-only.
 - **Want a larger/smarter LLM?** Try `qwen2.5:7b` if you have enough RAM (~8GB for the model).
 - **Redis queue growing?** Increase `BATCH_SIZE`, or set `LLM_ENABLED=false` to speed up processing.

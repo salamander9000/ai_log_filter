@@ -43,9 +43,10 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/syslog")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
-ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.15"))
-TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "500"))
+ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.3"))
+TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "1000"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
+CONTAMINATION = float(os.getenv("CONTAMINATION", "0.02"))
 
 # Input mode: "redis" or "file"
 INPUT_MODE = os.getenv("INPUT_MODE", "redis")
@@ -92,9 +93,12 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # ---------------------------------------------------------------------------
 # Syslog parser (regex-based, works for standard RFC 3164 syslog)
 # ---------------------------------------------------------------------------
-# Example: "Mar 24 10:15:32 myhost sshd[12345]: Failed password for root from 10.0.0.1 port 22 ssh2"
+# Examples:
+#   "Mar 24 10:15:32 myhost sshd[12345]: Failed password for root ..."
+#   "<13>Mar 24 23:37:02 vcvub10223 sshd[12345]: Failed password ..."
 SYSLOG_RE = re.compile(
-    r"^(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"^(?:<\d{1,3}>)?"                           # optional RFC 3164 priority prefix
+    r"(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
     r"(?P<hostname>\S+)\s+"
     r"(?P<process>\S+?)(?:\[(?P<pid>\d+)\])?:\s+"
     r"(?P<message>.+)$"
@@ -287,9 +291,11 @@ def _parse_hour(ts_str: str) -> int:
 class AnomalyDetector:
     """Wraps Isolation Forest with periodic retraining."""
 
-    def __init__(self, training_window: int = 500, threshold: float = -0.15):
+    def __init__(self, training_window: int = 500, threshold: float = -0.3,
+                 contamination: float = 0.02):
         self.training_window = training_window
         self.threshold = threshold
+        self.contamination = contamination
         self.buffer = deque(maxlen=training_window * 2)
         self.model: IsolationForest | None = None
         self.scaler = StandardScaler()
@@ -330,7 +336,7 @@ class AnomalyDetector:
 
         self.model = IsolationForest(
             n_estimators=200,
-            contamination=0.05,  # expect ~5% anomalies
+            contamination=self.contamination,
             random_state=42,
             n_jobs=-1,
         )
@@ -883,6 +889,7 @@ def main():
     log.info("Config: LLM_WORKERS=%s", LLM_WORKERS)
     log.info("Config: ANOMALY_THRESHOLD=%s", ANOMALY_THRESHOLD)
     log.info("Config: TRAINING_WINDOW=%s", TRAINING_WINDOW)
+    log.info("Config: CONTAMINATION=%s", CONTAMINATION)
 
     # --- Initialize components ---
     os_client = create_opensearch_client()
@@ -904,6 +911,7 @@ def main():
     anomaly_detector = AnomalyDetector(
         training_window=TRAINING_WINDOW,
         threshold=ANOMALY_THRESHOLD,
+        contamination=CONTAMINATION,
     )
     stats = StatsTracker(os_client)
 
