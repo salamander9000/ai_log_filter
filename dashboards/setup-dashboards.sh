@@ -3,6 +3,12 @@
 # Setup OpenSearch Dashboards: index patterns, visualizations, and dashboard.
 # Run this after the stack is up and some data has been indexed.
 #
+# Layout:
+#   Row 1: LLM Threat Categories | LLM Severity | Pending LLM + LLM Queue
+#   Row 2: LLM Analysis Detail Table (full width)
+#   Row 3: Events Over Time | Anomaly Score Distribution | Top Anomalous Hosts
+#   Row 4: Suspicious Patterns | Processing Throughput | Anomaly Rate
+#
 # Usage: ./setup-dashboards.sh [DASHBOARDS_URL]
 #   Default: http://localhost:5601
 #
@@ -13,6 +19,18 @@ DASHBOARDS_URL="${1:-http://localhost:5601}"
 API="${DASHBOARDS_URL}/api/saved_objects"
 HEADER='Content-Type: application/json'
 OSD_HEADER='osd-xsrf: true'
+
+# Helper: create or overwrite a saved object
+# Usage: put_object <type> <id> <json_body>
+put_object() {
+    local type="$1" id="$2" body="$3"
+    # Delete first (ignore errors if it doesn't exist)
+    curl -s -X DELETE "${API}/${type}/${id}" -H "${OSD_HEADER}" > /dev/null 2>&1 || true
+    # Create
+    curl -s -X POST "${API}/${type}/${id}?overwrite=true" \
+        -H "${HEADER}" -H "${OSD_HEADER}" \
+        -d "${body}" > /dev/null 2>&1
+}
 
 echo "=== Setting up OpenSearch Dashboards at ${DASHBOARDS_URL} ==="
 
@@ -28,6 +46,14 @@ for i in $(seq 1 60); do
 done
 
 # -----------------------------------------------------------------------
+# Filter JSON snippets (reused across visualizations)
+# -----------------------------------------------------------------------
+# Filter: llm_analyzed = true
+FILTER_LLM_TRUE='[{"meta":{"index":"logs-anomalies","negate":false,"disabled":false,"alias":"LLM Analyzed","type":"phrase","key":"llm_analyzed","params":{"query":true}},"query":{"match_phrase":{"llm_analyzed":true}}}]'
+# Filter: llm_analyzed = false
+FILTER_LLM_FALSE='[{"meta":{"index":"logs-anomalies","negate":false,"disabled":false,"alias":"Pending LLM","type":"phrase","key":"llm_analyzed","params":{"query":false}},"query":{"match_phrase":{"llm_analyzed":false}}}]'
+
+# -----------------------------------------------------------------------
 # 1. Index Patterns
 # -----------------------------------------------------------------------
 echo ""
@@ -35,14 +61,13 @@ echo "--- Creating index patterns ---"
 
 for IDX in logs-processed logs-anomalies logs-stats; do
     echo "Creating index pattern: ${IDX}"
-    curl -s -X POST "${API}/index-pattern/${IDX}" \
-        -H "${HEADER}" -H "${OSD_HEADER}" \
-        -d "{
-            \"attributes\": {
-                \"title\": \"${IDX}\",
-                \"timeFieldName\": \"@timestamp\"
-            }
-        }" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  -> {d.get(\"id\", \"error\")}')" 2>/dev/null || echo "  -> (may already exist)"
+    put_object "index-pattern" "${IDX}" "{
+        \"attributes\": {
+            \"title\": \"${IDX}\",
+            \"timeFieldName\": \"@timestamp\"
+        }
+    }"
+    echo "  -> done"
 done
 
 # Set default index pattern
@@ -56,11 +81,90 @@ curl -s -X POST "${DASHBOARDS_URL}/api/opensearch-dashboards/settings" \
 echo ""
 echo "--- Creating visualizations ---"
 
-# Viz 1: Events over time (area chart)
+# === ROW 1: LLM Analysis (top of dashboard) ===
+
+# Viz: Threat Categories (donut) - LLM analyzed only
+echo "Creating: Threat Categories (LLM)"
+put_object "visualization" "viz-threat-categories" '{
+    "attributes": {
+        "title": "Threat Categories (LLM Analyzed)",
+        "visState": "{\"title\":\"Threat Categories (LLM Analyzed)\",\"type\":\"pie\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"llm_threat_category\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":10},\"schema\":\"segment\"}],\"params\":{\"type\":\"pie\",\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true,\"labels\":{\"show\":true,\"values\":true,\"last_level\":true,\"truncate\":100}}}",
+        "uiStateJSON": "{}",
+        "description": "LLM-classified threat categories (only analyzed events)",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":'"${FILTER_LLM_TRUE}"'}"
+        }
+    }
+}'
+echo "  -> done"
+
+# Viz: LLM Severity Breakdown (horizontal bar) - LLM analyzed only
+echo "Creating: LLM Severity Breakdown"
+put_object "visualization" "viz-llm-severity" '{
+    "attributes": {
+        "title": "LLM Severity Breakdown",
+        "visState": "{\"title\":\"LLM Severity Breakdown\",\"type\":\"horizontal_bar\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"llm_severity\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":5},\"schema\":\"segment\"}],\"params\":{\"type\":\"horizontal_bar\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"BottomAxis-1\",\"type\":\"value\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Count\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"histogram\",\"mode\":\"normal\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\"}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\"}}",
+        "uiStateJSON": "{}",
+        "description": "Severity levels assigned by the LLM (only analyzed events)",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":'"${FILTER_LLM_TRUE}"'}"
+        }
+    }
+}'
+echo "  -> done"
+
+# Viz: Pending LLM Analysis (metric count)
+echo "Creating: Pending LLM Analysis"
+put_object "visualization" "viz-pending-llm" '{
+    "attributes": {
+        "title": "Pending LLM Analysis",
+        "visState": "{\"title\":\"Pending LLM Analysis\",\"type\":\"metric\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}],\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"invertColors\":false,\"style\":{\"bgFill\":\"#000\",\"bgColor\":false,\"labelColor\":false,\"subText\":\"anomalies awaiting LLM\",\"fontSize\":60}}}}",
+        "uiStateJSON": "{}",
+        "description": "Number of anomalies not yet analyzed by the LLM",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":'"${FILTER_LLM_FALSE}"'}"
+        }
+    }
+}'
+echo "  -> done"
+
+# Viz: LLM Queue Depth (line chart from stats)
+echo "Creating: LLM Queue Depth"
+put_object "visualization" "viz-llm-queue-depth" '{
+    "attributes": {
+        "title": "LLM Queue Depth",
+        "visState": "{\"title\":\"LLM Queue Depth\",\"type\":\"line\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"max\",\"params\":{\"field\":\"llm_queue_depth\"},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"params\":{\"field\":\"@timestamp\",\"timeRange\":{\"from\":\"now-1h\",\"to\":\"now\"},\"useNormalizedOpenSearchInterval\":true,\"interval\":\"auto\",\"min_doc_count\":1},\"schema\":\"segment\"}],\"params\":{\"type\":\"line\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Queue depth\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"area\",\"mode\":\"normal\",\"data\":{\"label\":\"Queue depth\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\",\"drawLinesBetweenPoints\":true,\"lineWidth\":2,\"showCircles\":false}],\"addTooltip\":true,\"addLegend\":false,\"legendPosition\":\"right\"}}",
+        "uiStateJSON": "{}",
+        "description": "LLM processing queue depth over time",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-stats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+        }
+    }
+}'
+echo "  -> done"
+
+# === ROW 2: LLM Detail Table ===
+
+# Viz: LLM Analysis Detail Table (saved search) - LLM analyzed only
+echo "Creating: LLM Analysis Detail Table"
+put_object "search" "search-latest-anomalies" '{
+    "attributes": {
+        "title": "LLM-Analyzed Threats (Detail)",
+        "description": "Anomalous events analyzed by the LLM with threat classification and explanation",
+        "columns": ["@timestamp", "hostname", "process", "llm_threat_category", "llm_severity", "llm_explanation", "anomaly_score", "llm_recommended_action", "message"],
+        "sort": [["@timestamp", "desc"]],
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":'"${FILTER_LLM_TRUE}"',\"highlightAll\":true,\"version\":true}"
+        }
+    }
+}'
+echo "  -> done"
+
+# === ROW 3: Layer 1 Overview ===
+
+# Viz: Events Over Time (area chart)
 echo "Creating: Events Over Time"
-curl -s -X POST "${API}/visualization/viz-events-over-time" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+put_object "visualization" "viz-events-over-time" '{
     "attributes": {
         "title": "Events Over Time",
         "visState": "{\"title\":\"Events Over Time\",\"type\":\"area\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"params\":{\"field\":\"@timestamp\",\"timeRange\":{\"from\":\"now-1h\",\"to\":\"now\"},\"useNormalizedOpenSearchInterval\":true,\"scaleMetricValues\":false,\"interval\":\"auto\",\"drop_partials\":false,\"min_doc_count\":1,\"extended_bounds\":{}},\"schema\":\"segment\"},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"is_anomaly\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":2},\"schema\":\"group\"}],\"params\":{\"type\":\"area\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"style\":{},\"scale\":{\"type\":\"linear\"},\"labels\":{\"show\":true,\"filter\":true,\"truncate\":100},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"style\":{},\"scale\":{\"type\":\"linear\",\"mode\":\"normal\"},\"labels\":{\"show\":true,\"rotate\":0,\"filter\":false,\"truncate\":100},\"title\":{\"text\":\"Count\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"area\",\"mode\":\"stacked\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\",\"drawLinesBetweenPoints\":true,\"lineWidth\":2,\"showCircles\":true}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"times\":[],\"addTimeMarker\":false,\"thresholdLine\":{\"show\":false,\"value\":10,\"width\":1,\"style\":\"full\",\"color\":\"#E7664C\"}}}",
@@ -70,14 +174,12 @@ curl -s -X POST "${API}/visualization/viz-events-over-time" \
             "searchSourceJSON": "{\"index\":\"logs-processed\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
-# Viz 2: Anomaly Score Distribution (histogram)
+# Viz: Anomaly Score Distribution (histogram)
 echo "Creating: Anomaly Score Distribution"
-curl -s -X POST "${API}/visualization/viz-anomaly-score-dist" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+put_object "visualization" "viz-anomaly-score-dist" '{
     "attributes": {
         "title": "Anomaly Score Distribution",
         "visState": "{\"title\":\"Anomaly Score Distribution\",\"type\":\"histogram\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"histogram\",\"params\":{\"field\":\"anomaly_score\",\"interval\":0.05,\"extended_bounds\":{}},\"schema\":\"segment\"}],\"params\":{\"type\":\"histogram\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true,\"filter\":true,\"truncate\":100},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Count\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"histogram\",\"mode\":\"stacked\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\"}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\"}}",
@@ -87,48 +189,12 @@ curl -s -X POST "${API}/visualization/viz-anomaly-score-dist" \
             "searchSourceJSON": "{\"index\":\"logs-processed\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
-# Viz 3: Anomalies by Threat Category (pie chart)
-echo "Creating: Threat Categories"
-curl -s -X POST "${API}/visualization/viz-threat-categories" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
-    "attributes": {
-        "title": "Threat Categories (LLM)",
-        "visState": "{\"title\":\"Threat Categories (LLM)\",\"type\":\"pie\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"llm_threat_category\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":10},\"schema\":\"segment\"}],\"params\":{\"type\":\"pie\",\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true,\"labels\":{\"show\":true,\"values\":true,\"last_level\":true,\"truncate\":100}}}",
-        "uiStateJSON": "{}",
-        "description": "LLM-classified threat categories for anomalous events",
-        "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
-        }
-    }
-}' > /dev/null 2>&1
-echo "  -> done"
-
-# Viz 4: LLM Severity Breakdown (horizontal bar)
-echo "Creating: LLM Severity Breakdown"
-curl -s -X POST "${API}/visualization/viz-llm-severity" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
-    "attributes": {
-        "title": "LLM Severity Breakdown",
-        "visState": "{\"title\":\"LLM Severity Breakdown\",\"type\":\"horizontal_bar\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"llm_severity\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":5},\"schema\":\"segment\"}],\"params\":{\"type\":\"horizontal_bar\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"BottomAxis-1\",\"type\":\"value\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Count\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"histogram\",\"mode\":\"normal\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\"}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\"}}",
-        "uiStateJSON": "{}",
-        "description": "Severity levels assigned by the LLM",
-        "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
-        }
-    }
-}' > /dev/null 2>&1
-echo "  -> done"
-
-# Viz 5: Top Anomalous Hosts (data table)
+# Viz: Top Anomalous Hosts (data table)
 echo "Creating: Top Anomalous Hosts"
-curl -s -X POST "${API}/visualization/viz-top-anomalous-hosts" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+put_object "visualization" "viz-top-anomalous-hosts" '{
     "attributes": {
         "title": "Top Anomalous Hosts",
         "visState": "{\"title\":\"Top Anomalous Hosts\",\"type\":\"table\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"hostname\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":20},\"schema\":\"bucket\"},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"process\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":10},\"schema\":\"bucket\"}],\"params\":{\"perPage\":10,\"showPartialRows\":false,\"showMetricsAtAllLevels\":false,\"sort\":{\"columnIndex\":null,\"direction\":null},\"showTotal\":false,\"totalFunc\":\"sum\",\"percentageCol\":\"\"}}",
@@ -138,14 +204,14 @@ curl -s -X POST "${API}/visualization/viz-top-anomalous-hosts" \
             "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
-# Viz 6: Suspicious Pattern Categories (tag cloud)
+# === ROW 4: System Stats ===
+
+# Viz: Suspicious Pattern Categories (tag cloud)
 echo "Creating: Suspicious Patterns"
-curl -s -X POST "${API}/visualization/viz-suspicious-patterns" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+put_object "visualization" "viz-suspicious-patterns" '{
     "attributes": {
         "title": "Suspicious Pattern Categories",
         "visState": "{\"title\":\"Suspicious Pattern Categories\",\"type\":\"tagcloud\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"suspicious_categories\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":20},\"schema\":\"segment\"}],\"params\":{\"scale\":\"linear\",\"orientation\":\"single\",\"minFontSize\":18,\"maxFontSize\":72,\"showLabel\":true}}",
@@ -155,14 +221,12 @@ curl -s -X POST "${API}/visualization/viz-suspicious-patterns" \
             "searchSourceJSON": "{\"index\":\"logs-processed\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
-# Viz 7: Processing Stats (line chart)
+# Viz: Processing Throughput (line chart)
 echo "Creating: Processing Throughput"
-curl -s -X POST "${API}/visualization/viz-processing-stats" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+put_object "visualization" "viz-processing-stats" '{
     "attributes": {
         "title": "Processing Throughput (events/sec)",
         "visState": "{\"title\":\"Processing Throughput (events/sec)\",\"type\":\"line\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"avg\",\"params\":{\"field\":\"events_per_sec\"},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"params\":{\"field\":\"@timestamp\",\"timeRange\":{\"from\":\"now-1h\",\"to\":\"now\"},\"useNormalizedOpenSearchInterval\":true,\"interval\":\"auto\",\"min_doc_count\":1},\"schema\":\"segment\"}],\"params\":{\"type\":\"line\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Events/sec\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"line\",\"mode\":\"normal\",\"data\":{\"label\":\"Avg events/sec\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\",\"drawLinesBetweenPoints\":true,\"lineWidth\":2,\"showCircles\":true}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\"}}",
@@ -172,14 +236,12 @@ curl -s -X POST "${API}/visualization/viz-processing-stats" \
             "searchSourceJSON": "{\"index\":\"logs-stats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
-# Viz 8: Anomaly Rate over time (metric)
+# Viz: Anomaly Rate (line chart)
 echo "Creating: Anomaly Rate"
-curl -s -X POST "${API}/visualization/viz-anomaly-rate" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+put_object "visualization" "viz-anomaly-rate" '{
     "attributes": {
         "title": "Anomaly Rate (%)",
         "visState": "{\"title\":\"Anomaly Rate (%)\",\"type\":\"line\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"avg\",\"params\":{\"field\":\"anomaly_rate_pct\"},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"params\":{\"field\":\"@timestamp\",\"timeRange\":{\"from\":\"now-1h\",\"to\":\"now\"},\"useNormalizedOpenSearchInterval\":true,\"interval\":\"auto\",\"min_doc_count\":1},\"schema\":\"segment\"}],\"params\":{\"type\":\"line\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"LeftAxis-1\",\"type\":\"value\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Anomaly %\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"line\",\"mode\":\"normal\",\"data\":{\"label\":\"Anomaly Rate %\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\",\"drawLinesBetweenPoints\":true,\"lineWidth\":2,\"showCircles\":true}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\"}}",
@@ -189,39 +251,40 @@ curl -s -X POST "${API}/visualization/viz-anomaly-rate" \
             "searchSourceJSON": "{\"index\":\"logs-stats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
-}' > /dev/null 2>&1
-echo "  -> done"
-
-# Viz 9: Anomaly detail table (latest anomalies with LLM analysis)
-echo "Creating: Latest Anomalies (detail table)"
-curl -s -X POST "${API}/search/search-latest-anomalies" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
-    "attributes": {
-        "title": "Latest Anomalies with LLM Analysis",
-        "description": "Detailed table of recent anomalous events with AI explanations",
-        "columns": ["@timestamp", "hostname", "process", "severity", "anomaly_score", "llm_threat_category", "llm_severity", "llm_explanation", "message"],
-        "sort": [["@timestamp", "desc"]],
-        "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"
-        }
-    }
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
 # -----------------------------------------------------------------------
-# 3. Dashboard
+# 3. Dashboard - LLM analysis on top, Layer 1 noise below
 # -----------------------------------------------------------------------
 echo ""
 echo "--- Creating dashboard ---"
 
-curl -s -X POST "${API}/dashboard/dashboard-ai-log-filter" \
-    -H "${HEADER}" -H "${OSD_HEADER}" \
-    -d '{
+# Panel layout (48 column grid):
+# Row 1 (y=0,  h=12): Threat Categories(16w) | LLM Severity(16w) | Pending(8w) + Queue(8w)
+# Row 2 (y=12, h=14): LLM Detail Table (48w full width)
+# Row 3 (y=26, h=12): Events Over Time(20w) | Score Distribution(14w) | Top Hosts(14w)
+# Row 4 (y=38, h=10): Suspicious Patterns(16w) | Throughput(16w) | Anomaly Rate(16w)
+
+PANELS='['
+PANELS+='{"embeddableConfig":{},"gridData":{"x":0,"y":0,"w":16,"h":12,"i":"1"},"id":"viz-threat-categories","panelIndex":"1","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":16,"y":0,"w":16,"h":12,"i":"2"},"id":"viz-llm-severity","panelIndex":"2","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":32,"y":0,"w":8,"h":12,"i":"3"},"id":"viz-pending-llm","panelIndex":"3","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":40,"y":0,"w":8,"h":12,"i":"4"},"id":"viz-llm-queue-depth","panelIndex":"4","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":0,"y":12,"w":48,"h":14,"i":"5"},"id":"search-latest-anomalies","panelIndex":"5","type":"search","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":0,"y":26,"w":20,"h":12,"i":"6"},"id":"viz-events-over-time","panelIndex":"6","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":20,"y":26,"w":14,"h":12,"i":"7"},"id":"viz-anomaly-score-dist","panelIndex":"7","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":34,"y":26,"w":14,"h":12,"i":"8"},"id":"viz-top-anomalous-hosts","panelIndex":"8","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":0,"y":38,"w":16,"h":10,"i":"9"},"id":"viz-suspicious-patterns","panelIndex":"9","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":16,"y":38,"w":16,"h":10,"i":"10"},"id":"viz-processing-stats","panelIndex":"10","type":"visualization","version":"2.18.0"},'
+PANELS+='{"embeddableConfig":{},"gridData":{"x":32,"y":38,"w":16,"h":10,"i":"11"},"id":"viz-anomaly-rate","panelIndex":"11","type":"visualization","version":"2.18.0"}'
+PANELS+=']'
+
+put_object "dashboard" "dashboard-ai-log-filter" '{
     "attributes": {
         "title": "AI Log Filter - PoC Dashboard",
-        "description": "Overview of AI-powered syslog anomaly detection",
-        "panelsJSON": "[{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":0,\"w\":32,\"h\":12,\"i\":\"1\"},\"id\":\"viz-events-over-time\",\"panelIndex\":\"1\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":32,\"y\":0,\"w\":16,\"h\":12,\"i\":\"2\"},\"id\":\"viz-anomaly-score-dist\",\"panelIndex\":\"2\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":12,\"w\":16,\"h\":12,\"i\":\"3\"},\"id\":\"viz-threat-categories\",\"panelIndex\":\"3\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":16,\"y\":12,\"w\":16,\"h\":12,\"i\":\"4\"},\"id\":\"viz-llm-severity\",\"panelIndex\":\"4\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":32,\"y\":12,\"w\":16,\"h\":12,\"i\":\"5\"},\"id\":\"viz-top-anomalous-hosts\",\"panelIndex\":\"5\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":24,\"w\":16,\"h\":10,\"i\":\"6\"},\"id\":\"viz-suspicious-patterns\",\"panelIndex\":\"6\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":16,\"y\":24,\"w\":16,\"h\":10,\"i\":\"7\"},\"id\":\"viz-processing-stats\",\"panelIndex\":\"7\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":32,\"y\":24,\"w\":16,\"h\":10,\"i\":\"8\"},\"id\":\"viz-anomaly-rate\",\"panelIndex\":\"8\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":34,\"w\":48,\"h\":14,\"i\":\"9\"},\"id\":\"search-latest-anomalies\",\"panelIndex\":\"9\",\"type\":\"search\",\"version\":\"2.18.0\"}]",
+        "description": "AI-powered syslog anomaly detection - LLM analysis on top, Layer 1 ML below",
+        "panelsJSON": "'"$(echo "${PANELS}" | sed 's/"/\\"/g')"'",
         "optionsJSON": "{\"hidePanelTitles\":false,\"useMargins\":true}",
         "timeRestore": true,
         "timeTo": "now",
@@ -235,17 +298,19 @@ curl -s -X POST "${API}/dashboard/dashboard-ai-log-filter" \
         }
     },
     "references": [
-        {"id": "viz-events-over-time", "name": "panel_1", "type": "visualization"},
-        {"id": "viz-anomaly-score-dist", "name": "panel_2", "type": "visualization"},
-        {"id": "viz-threat-categories", "name": "panel_3", "type": "visualization"},
-        {"id": "viz-llm-severity", "name": "panel_4", "type": "visualization"},
-        {"id": "viz-top-anomalous-hosts", "name": "panel_5", "type": "visualization"},
-        {"id": "viz-suspicious-patterns", "name": "panel_6", "type": "visualization"},
-        {"id": "viz-processing-stats", "name": "panel_7", "type": "visualization"},
-        {"id": "viz-anomaly-rate", "name": "panel_8", "type": "visualization"},
-        {"id": "search-latest-anomalies", "name": "panel_9", "type": "search"}
+        {"id": "viz-threat-categories", "name": "panel_1", "type": "visualization"},
+        {"id": "viz-llm-severity", "name": "panel_2", "type": "visualization"},
+        {"id": "viz-pending-llm", "name": "panel_3", "type": "visualization"},
+        {"id": "viz-llm-queue-depth", "name": "panel_4", "type": "visualization"},
+        {"id": "search-latest-anomalies", "name": "panel_5", "type": "search"},
+        {"id": "viz-events-over-time", "name": "panel_6", "type": "visualization"},
+        {"id": "viz-anomaly-score-dist", "name": "panel_7", "type": "visualization"},
+        {"id": "viz-top-anomalous-hosts", "name": "panel_8", "type": "visualization"},
+        {"id": "viz-suspicious-patterns", "name": "panel_9", "type": "visualization"},
+        {"id": "viz-processing-stats", "name": "panel_10", "type": "visualization"},
+        {"id": "viz-anomaly-rate", "name": "panel_11", "type": "visualization"}
     ]
-}' > /dev/null 2>&1
+}'
 echo "  -> done"
 
 echo ""
@@ -253,5 +318,8 @@ echo "=== Dashboard setup complete! ==="
 echo ""
 echo "Open your browser: ${DASHBOARDS_URL}/app/dashboards#/view/dashboard-ai-log-filter"
 echo ""
-echo "If visualizations show 'no data', wait a few minutes for the AI service"
-echo "to process logs and index them into OpenSearch."
+echo "Dashboard layout:"
+echo "  TOP:    LLM Threat Categories | LLM Severity | Pending Count | Queue Depth"
+echo "  MIDDLE: LLM Analysis Detail Table (only llm_analyzed=true)"
+echo "  LOWER:  Events Over Time | Score Distribution | Top Hosts"
+echo "  BOTTOM: Suspicious Patterns | Throughput | Anomaly Rate"
