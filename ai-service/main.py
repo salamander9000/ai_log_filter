@@ -17,12 +17,14 @@ import re
 import sys
 import json
 import time
+import uuid
 import signal
 import logging
 import hashlib
 import datetime
 from collections import defaultdict, deque
 from threading import Thread, Event
+from queue import Queue, Empty
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
@@ -47,6 +49,11 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 
 # Input mode: "redis" or "file"
 INPUT_MODE = os.getenv("INPUT_MODE", "redis")
+
+# Number of LLM worker threads (async analysis of flagged events)
+LLM_WORKERS = int(os.getenv("LLM_WORKERS", "1"))
+# Max LLM queue size (drop oldest if full to avoid unbounded memory)
+LLM_QUEUE_SIZE = int(os.getenv("LLM_QUEUE_SIZE", "1000"))
 
 # Redis configuration (used when INPUT_MODE=redis)
 REDIS_HOST = os.getenv("REDIS_HOST", "redis://localhost:6379")
@@ -432,6 +439,147 @@ def ensure_ollama_model(model: str = LLM_MODEL):
 
 
 # ---------------------------------------------------------------------------
+# Async LLM worker - processes flagged events in background threads
+# ---------------------------------------------------------------------------
+class LLMWorker:
+    """
+    Background worker that processes anomalous events through the LLM.
+
+    The main loop indexes anomalies immediately (llm_analyzed=false) and
+    puts them on a queue. Worker threads pick them up, run the LLM, and
+    update the OpenSearch document with the results.
+
+    This decouples Layer 1 (fast ML scoring) from Layer 2 (slow LLM),
+    so the main loop never blocks on LLM inference.
+    """
+
+    def __init__(
+        self,
+        os_client: OpenSearch,
+        stats: "StatsTracker",
+        num_workers: int = 1,
+        queue_size: int = 1000,
+    ):
+        self.os_client = os_client
+        self.stats = stats
+        self.queue: Queue = Queue(maxsize=queue_size)
+        self.num_workers = num_workers
+        self.threads: list[Thread] = []
+        self._dropped = 0
+
+    def start(self):
+        """Start the worker threads."""
+        for i in range(self.num_workers):
+            t = Thread(
+                target=self._worker_loop,
+                args=(i,),
+                daemon=True,
+                name=f"llm-worker-{i}",
+            )
+            t.start()
+            self.threads.append(t)
+        log.info(
+            "LLM async workers started: %d workers, queue_size=%d",
+            self.num_workers, self.queue.maxsize,
+        )
+
+    def submit(self, doc_id: str, parsed: dict, metadata: dict, score: float):
+        """
+        Submit an anomalous event for LLM analysis.
+        Non-blocking: drops the event if the queue is full.
+        """
+        task = {
+            "doc_id": doc_id,
+            "parsed": parsed,
+            "metadata": metadata,
+            "score": score,
+        }
+        try:
+            self.queue.put_nowait(task)
+        except Exception:
+            self._dropped += 1
+            if self._dropped % 100 == 1:
+                log.warning(
+                    "LLM queue full (size=%d), dropped %d events so far",
+                    self.queue.maxsize, self._dropped,
+                )
+
+    @property
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    def _worker_loop(self, worker_id: int):
+        """Worker thread: pick tasks from queue, run LLM, update OpenSearch."""
+        log.info("[llm-worker-%d] Started", worker_id)
+
+        while not shutdown_event.is_set():
+            try:
+                task = self.queue.get(timeout=1)
+            except Empty:
+                continue
+
+            doc_id = task["doc_id"]
+            parsed = task["parsed"]
+            metadata = task["metadata"]
+            score = task["score"]
+
+            prompt = LLM_PROMPT_TEMPLATE.format(
+                log_line=parsed["raw"],
+                hostname=parsed["hostname"],
+                process=parsed["process"],
+                score=score,
+                patterns=", ".join(metadata["suspicious_categories"]) or "none",
+                template=metadata["template_str"],
+            )
+
+            t0 = time.time()
+            llm_result = query_ollama(prompt)
+            latency_ms = (time.time() - t0) * 1000
+            self.stats.record_llm_query(latency_ms)
+
+            if llm_result:
+                # Update the existing document in OpenSearch
+                update_body = {
+                    "doc": {
+                        "llm_analyzed": True,
+                        "llm_threat_category": llm_result.get("threat_category", "unknown"),
+                        "llm_severity": llm_result.get("severity", "unknown"),
+                        "llm_explanation": llm_result.get("explanation", ""),
+                        "llm_recommended_action": llm_result.get("recommended_action", ""),
+                        "llm_raw_response": json.dumps(llm_result),
+                    }
+                }
+
+                try:
+                    self.os_client.update(
+                        index=IDX_ANOMALIES,
+                        id=doc_id,
+                        body=update_body,
+                    )
+                except Exception as e:
+                    log.warning("[llm-worker-%d] Failed to update doc %s: %s", worker_id, doc_id, e)
+
+                log.info(
+                    "[llm-worker-%d] ANALYZED [%s/%s] %s | %s",
+                    worker_id,
+                    llm_result.get("threat_category", "?"),
+                    llm_result.get("severity", "?"),
+                    parsed["raw"][:100],
+                    llm_result.get("explanation", "")[:80],
+                )
+            else:
+                log.warning("[llm-worker-%d] LLM returned no result for doc %s", worker_id, doc_id)
+
+            self.queue.task_done()
+
+        log.info("[llm-worker-%d] Stopped", worker_id)
+
+
+# ---------------------------------------------------------------------------
 # OpenSearch integration
 # ---------------------------------------------------------------------------
 def create_opensearch_client() -> OpenSearch:
@@ -527,6 +675,8 @@ def setup_indices(client: OpenSearch):
                 "unique_templates": {"type": "integer"},
                 "llm_queries": {"type": "long"},
                 "llm_avg_latency_ms": {"type": "float"},
+                "llm_queue_depth": {"type": "integer"},
+                "llm_dropped": {"type": "long"},
             }
         },
         "settings": {
@@ -573,7 +723,8 @@ class StatsTracker:
         self.llm_queries += 1
         self.llm_total_latency += latency_ms
 
-    def maybe_flush(self, model_trained: bool, buffer_size: int, unique_templates: int):
+    def maybe_flush(self, model_trained: bool, buffer_size: int, unique_templates: int,
+                    llm_queue_depth: int = 0, llm_dropped: int = 0):
         now = time.time()
         elapsed = now - self.last_flush
         if elapsed < self.flush_interval:
@@ -595,6 +746,8 @@ class StatsTracker:
             "unique_templates": unique_templates,
             "llm_queries": self.llm_queries,
             "llm_avg_latency_ms": round(avg_llm_latency, 1),
+            "llm_queue_depth": llm_queue_depth,
+            "llm_dropped": llm_dropped,
         }
 
         try:
@@ -606,8 +759,10 @@ class StatsTracker:
         self.last_total = self.total
 
         log.info(
-            "STATS | total=%d anomalies=%d rate=%.1f%% eps=%.1f templates=%d llm_queries=%d",
-            self.total, self.anomalous, anomaly_rate, eps, unique_templates, self.llm_queries,
+            "STATS | total=%d anomalies=%d rate=%.1f%% eps=%.1f templates=%d "
+            "llm_queries=%d llm_queue=%d llm_dropped=%d",
+            self.total, self.anomalous, anomaly_rate, eps, unique_templates,
+            self.llm_queries, llm_queue_depth, llm_dropped,
         )
 
 
@@ -725,6 +880,7 @@ def main():
         log.info("Config: LOG_FILE=%s", LOG_FILE)
     log.info("Config: LLM_MODEL=%s", LLM_MODEL)
     log.info("Config: LLM_ENABLED=%s", LLM_ENABLED)
+    log.info("Config: LLM_WORKERS=%s", LLM_WORKERS)
     log.info("Config: ANOMALY_THRESHOLD=%s", ANOMALY_THRESHOLD)
     log.info("Config: TRAINING_WINDOW=%s", TRAINING_WINDOW)
 
@@ -751,12 +907,23 @@ def main():
     )
     stats = StatsTracker(os_client)
 
+    # --- Async LLM worker ---
+    llm_worker = None
+    if llm_available and LLM_ENABLED:
+        llm_worker = LLMWorker(
+            os_client=os_client,
+            stats=stats,
+            num_workers=LLM_WORKERS,
+            queue_size=LLM_QUEUE_SIZE,
+        )
+        llm_worker.start()
+
     # Bulk indexing buffer
     bulk_buffer = []
 
     log.info("Initialization complete. Starting log processing ...")
 
-    # --- Main loop ---
+    # --- Main loop (Layer 1 only - never blocks on LLM) ---
     for line in get_input_source(shutdown_event):
         if shutdown_event.is_set():
             break
@@ -769,7 +936,7 @@ def main():
         # Extract features
         features, metadata = feature_extractor.extract(parsed)
 
-        # Anomaly detection
+        # Anomaly detection (Layer 1 - microseconds)
         score, is_anomaly = anomaly_detector.add_and_score(features)
 
         # Build the base document
@@ -799,50 +966,26 @@ def main():
             "_source": doc,
         })
 
-        # If anomaly, optionally run through LLM and index to anomalies index
+        # If anomaly: index immediately, then submit to LLM worker asynchronously
         if is_anomaly:
+            # Generate a unique doc ID so the LLM worker can update it later
+            doc_id = str(uuid.uuid4())
+
             anomaly_doc = dict(doc)
             anomaly_doc["llm_analyzed"] = False
 
-            if llm_available and LLM_ENABLED:
-                prompt = LLM_PROMPT_TEMPLATE.format(
-                    log_line=parsed["raw"],
-                    hostname=parsed["hostname"],
-                    process=parsed["process"],
-                    score=score,
-                    patterns=", ".join(metadata["suspicious_categories"]) or "none",
-                    template=metadata["template_str"],
-                )
-
-                t0 = time.time()
-                llm_result = query_ollama(prompt)
-                latency_ms = (time.time() - t0) * 1000
-                stats.record_llm_query(latency_ms)
-
-                if llm_result:
-                    anomaly_doc["llm_analyzed"] = True
-                    anomaly_doc["llm_threat_category"] = llm_result.get("threat_category", "unknown")
-                    anomaly_doc["llm_severity"] = llm_result.get("severity", "unknown")
-                    anomaly_doc["llm_explanation"] = llm_result.get("explanation", "")
-                    anomaly_doc["llm_recommended_action"] = llm_result.get("recommended_action", "")
-                    anomaly_doc["llm_raw_response"] = json.dumps(llm_result)
-
-                    log.info(
-                        "ANOMALY [%s/%s] %s | %s",
-                        llm_result.get("threat_category", "?"),
-                        llm_result.get("severity", "?"),
-                        parsed["raw"][:120],
-                        llm_result.get("explanation", "")[:100],
-                    )
-                else:
-                    log.info("ANOMALY [score=%.3f] %s", score, parsed["raw"][:120])
-            else:
-                log.info("ANOMALY [score=%.3f] %s", score, parsed["raw"][:120])
-
+            # Index to anomalies immediately (without LLM results)
             bulk_buffer.append({
                 "_index": IDX_ANOMALIES,
+                "_id": doc_id,
                 "_source": anomaly_doc,
             })
+
+            log.info("ANOMALY [score=%.3f] %s", score, parsed["raw"][:120])
+
+            # Submit to LLM worker for async analysis (non-blocking)
+            if llm_worker is not None:
+                llm_worker.submit(doc_id, parsed, metadata, score)
 
         # Track stats
         stats.record_event(is_anomaly)
@@ -857,6 +1000,8 @@ def main():
             model_trained=anomaly_detector.is_trained,
             buffer_size=len(anomaly_detector.buffer),
             unique_templates=len(feature_extractor.seen_templates),
+            llm_queue_depth=llm_worker.queue_depth if llm_worker else 0,
+            llm_dropped=llm_worker.dropped if llm_worker else 0,
         )
 
     # Final flush
