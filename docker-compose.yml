@@ -7,7 +7,7 @@ services:
     container_name: opensearch
     environment:
       - discovery.type=single-node
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=P0c_Adm1n!Str0ng#2026
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=X9k#mP2vL!qR7wZy
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
       - plugins.security.disabled=true          # PoC only - no TLS hassle
     ports:
