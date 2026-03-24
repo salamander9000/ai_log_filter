@@ -73,6 +73,30 @@ services:
     # No GPU - pure CPU inference
     # Model will be pulled on first run by the AI service
 
+  # --- Syslog TCP/UDP receiver (accepts remote syslog, pushes to Redis) ---
+  syslog-receiver:
+    build:
+      context: ./syslog-receiver
+      dockerfile: Dockerfile
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
+    container_name: syslog-receiver
+    environment:
+      - LISTEN_HOST=0.0.0.0
+      - LISTEN_PORT=5514
+      - REDIS_HOST=redis://redis:6379
+      - REDIS_KEY=filebeat:logs
+    ports:
+      - "5514:5514/tcp"
+      - "5514:5514/udp"
+    networks:
+      - lognet
+    depends_on:
+      redis:
+        condition: service_healthy
+
   # --- Synthetic syslog generator (demo mode only) ---
   log-generator:
     build:

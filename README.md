@@ -13,21 +13,34 @@ Proof of concept to evaluate local AI capabilities before committing to dedicate
 
 ## Architecture
 
-### Real mode (Filebeat + Redis)
+### Real mode - syslog-ng (recommended)
 
 ```
-/var/log/messages ──> Filebeat ──> Redis ──> Python AI Service ──> OpenSearch
-                      (host)       (buffer)  (main.py)             + Dashboards
-                                                  │
-  inject-anomalies.sh ──> /var/log/messages    Ollama (LLM)
-  (testing)                                    Qwen2.5-3B on CPU
+Remote servers                    Docker stack (AI server)
+──────────────                    ────────────────────────
+
+syslog-ng ──TCP:5514──> syslog-receiver ──> Redis ──> AI Service ──> OpenSearch
+                        (container)         (buffer)                  + Dashboards
+                                                          │
+inject-anomalies.sh ──> /var/log/messages                Ollama (LLM)
+(testing)               ──> syslog-ng (loops back)       Qwen2.5-3B on CPU
+```
+
+### Real mode - Filebeat
+
+```
+/var/log/messages ──> Filebeat ──> Redis ──> AI Service ──> OpenSearch + Dashboards
+                      (host)       (buffer)
 ```
 
 ### Demo mode (synthetic generator)
 
 ```
-log-generator ──> shared volume ──> Python AI Service ──> OpenSearch + Dashboards
+log-generator ──> shared volume ──> AI Service ──> OpenSearch + Dashboards
 ```
+
+Both syslog-ng and Filebeat can feed the pipeline simultaneously - they both
+push to the same Redis list.
 
 ### AI Pipeline (Two Layers)
 
@@ -41,17 +54,15 @@ log-generator ──> shared volume ──> Python AI Service ──> OpenSearch
 - Docker and Docker Compose
 - ~4GB RAM minimum (8GB+ recommended)
 - ~3GB disk for the LLM model (downloaded on first run)
-- Filebeat installed on host (for real mode)
+- syslog-ng or Filebeat on the host/remote servers (for real mode)
 
-## Quick Start - Real Mode (Filebeat + Redis)
+## Quick Start - Real Mode (syslog-ng)
 
 ```bash
 # 1. Start the stack (Redis mode is the default)
 docker compose up -d
 
-# 2. Install Filebeat config on the host
-sudo cp filebeat/filebeat.yml /etc/filebeat/filebeat.yml
-sudo systemctl restart filebeat
+# 2. Configure syslog-ng to forward to the AI server (see below)
 
 # 3. Wait ~2 minutes for OpenSearch + Ollama to be ready
 
@@ -64,6 +75,55 @@ sudo systemctl restart filebeat
 # 6. Inject some anomalies to test detection
 ./scripts/inject-anomalies.sh brute_force 20
 ./scripts/inject-anomalies.sh oom 5
+./scripts/inject-anomalies.sh all 30
+```
+
+### syslog-ng configuration
+
+Add this to your syslog-ng config (e.g., `/etc/syslog-ng/syslog-ng.conf` or a
+file in `/etc/syslog-ng/conf.d/`):
+
+```
+# Forward to AI Log Filter
+destination d_ai_filter {
+    tcp("<AI_SERVER_IP>" port(5514));
+};
+
+log {
+    source(s_sys);              # your existing source
+    destination(d_ai_filter);
+    # Keep existing destinations too - this is just a copy:
+    # destination(d_mesg);
+};
+```
+
+Replace `<AI_SERVER_IP>` with the IP of the server running the Docker stack.
+Port **5514** accepts both TCP and UDP.
+
+To forward from the **local** machine (AI server itself):
+
+```
+destination d_ai_filter {
+    tcp("127.0.0.1" port(5514));
+};
+```
+
+Reload syslog-ng: `sudo systemctl reload syslog-ng`
+
+## Quick Start - Real Mode (Filebeat alternative)
+
+```bash
+# 1. Start the stack
+docker compose up -d
+
+# 2. Install Filebeat config on the host
+sudo cp filebeat/filebeat.yml /etc/filebeat/filebeat.yml
+sudo systemctl restart filebeat
+
+# 3. Wait ~2 min, set up dashboards
+./dashboards/setup-dashboards.sh
+
+# 4. Inject anomalies
 ./scripts/inject-anomalies.sh all 30
 ```
 
@@ -81,7 +141,7 @@ INPUT_MODE=file docker compose --profile demo up -d
 
 The `scripts/inject-anomalies.sh` script injects realistic anomalous events
 into `/var/log/messages` via the `logger` command (proper syslog formatting).
-Filebeat picks them up and pushes through the full pipeline.
+syslog-ng/Filebeat picks them up and pushes through the full pipeline.
 
 ```bash
 ./scripts/inject-anomalies.sh list              # show all scenarios
@@ -98,11 +158,12 @@ Filebeat picks them up and pushes through the full pipeline.
 
 ## Accessing the Stack
 
-| Service | URL |
-|---------|-----|
+| Service | URL / Port |
+|---------|------------|
 | OpenSearch Dashboards | http://localhost:5601 |
 | OpenSearch API | http://localhost:9200 |
 | Ollama API | http://localhost:11434 |
+| Syslog receiver | TCP+UDP port 5514 |
 | Redis | localhost:6379 |
 
 ## Configuration
