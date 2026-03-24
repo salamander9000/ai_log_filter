@@ -1,0 +1,10 @@
+# Corporate pip configuration
+# Copy this file to ai-service/pip.conf and fill in your values.
+#
+# Example:
+#   cp pip.conf.example ai-service/pip.conf
+#   # edit ai-service/pip.conf with your corporate mirror URL
+#
+[global]
+index-url = https://artifactory.corp.example.com/api/pypi/pypi-remote/simple
+trusted-host = artifactory.corp.example.com

@@ -7,3 +7,6 @@ dist/
 build/
 .venv/
 venv/
+
+# Corporate pip config (contains internal URLs - do not commit)
+pip.conf
