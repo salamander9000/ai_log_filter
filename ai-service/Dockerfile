@@ -6,6 +6,12 @@ WORKDIR /app
 # Uses glob so the build won't fail if the file doesn't exist
 COPY pip.conf* /etc/
 
+# Proxy support: Docker automatically passes HTTP_PROXY / HTTPS_PROXY
+# build args into the build environment. Set them in .env or shell.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 # Install dependencies first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

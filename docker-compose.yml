@@ -46,6 +46,11 @@ services:
       - "11434:11434"
     volumes:
       - ollama-models:/root/.ollama
+    environment:
+      # Ollama needs proxy to pull models from the internet
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
     networks:
       - lognet
     # No GPU - pure CPU inference
@@ -56,6 +61,10 @@ services:
     build:
       context: ./sample-logs
       dockerfile: Dockerfile
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     container_name: log-generator
     volumes:
       - shared-logs:/var/log/synthetic
@@ -67,6 +76,10 @@ services:
     build:
       context: ./ai-service
       dockerfile: Dockerfile
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     container_name: ai-log-service
     environment:
       - OPENSEARCH_HOST=http://opensearch:9200
