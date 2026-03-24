@@ -193,10 +193,10 @@ class FeatureExtractor:
         msg = parsed["message"]
         self.total_events += 1
 
-        # Drain3 template
+        # Drain3 template (add_log_message returns a dict)
         result = self.miner.add_log_message(msg)
-        template_id = result.cluster_id if result else 0
-        template_str = result.get_template() if result else msg
+        template_id = result["cluster_id"] if result else 0
+        template_str = result["template_mined"] if result else msg
 
         # Template frequency
         self.template_counts[template_id] += 1
@@ -614,8 +614,8 @@ def tail_file(filepath: str, shutdown: Event):
         return
 
     with open(filepath, "r") as f:
-        # Start from the end of the file
-        f.seek(0, 2)
+        # Start from the beginning so we process existing data too
+        f.seek(0)
 
         while not shutdown.is_set():
             line = f.readline()

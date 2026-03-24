@@ -7,7 +7,7 @@ services:
     container_name: opensearch
     environment:
       - discovery.type=single-node
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin_12345!
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=P0c_Adm1n!Str0ng#2026
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
       - plugins.security.disabled=true          # PoC only - no TLS hassle
     ports:
@@ -87,8 +87,8 @@ services:
       - LOG_FILE=/var/log/synthetic/syslog
       - LLM_MODEL=qwen2.5:3b
       - LLM_ENABLED=true
-      - ANOMALY_THRESHOLD=-0.15
-      - TRAINING_WINDOW=500
+      - "ANOMALY_THRESHOLD=-0.15"
+      - TRAINING_WINDOW=200
       - BATCH_SIZE=50
     volumes:
       - shared-logs:/var/log/synthetic:ro
