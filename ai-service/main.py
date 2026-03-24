@@ -2,9 +2,14 @@
 """
 AI Log Filter PoC - Single-script log analysis service.
 
-Reads syslog files, parses log templates with Drain3, detects anomalies
-with Isolation Forest, and optionally enriches flagged events with a
-local LLM via Ollama. Results are indexed into OpenSearch.
+Reads syslog from Redis (Filebeat -> Redis -> here) or from a log file,
+parses log templates with Drain3, detects anomalies with Isolation Forest,
+and optionally enriches flagged events with a local LLM via Ollama.
+Results are indexed into OpenSearch.
+
+INPUT_MODE:
+  redis  - consume from Redis list (Filebeat pushes JSON events)
+  file   - tail a log file (synthetic generator / demo mode)
 """
 
 import os
@@ -26,6 +31,7 @@ from opensearchpy import OpenSearch, helpers as os_helpers
 from drain3 import TemplateMiner
 from drain3.template_miner_config import TemplateMinerConfig
 import requests
+import redis as redispy
 
 # ---------------------------------------------------------------------------
 # Configuration (all from environment, with sane defaults)
@@ -38,6 +44,13 @@ LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
 ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.15"))
 TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "500"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
+
+# Input mode: "redis" or "file"
+INPUT_MODE = os.getenv("INPUT_MODE", "redis")
+
+# Redis configuration (used when INPUT_MODE=redis)
+REDIS_HOST = os.getenv("REDIS_HOST", "redis://localhost:6379")
+REDIS_KEY = os.getenv("REDIS_KEY", "filebeat:logs")
 
 # How many seconds worth of logs to aggregate into a feature window
 FEATURE_WINDOW_SEC = int(os.getenv("FEATURE_WINDOW_SEC", "60"))
@@ -599,15 +612,15 @@ class StatsTracker:
 
 
 # ---------------------------------------------------------------------------
-# File tailer (similar to tail -F)
+# Input sources
 # ---------------------------------------------------------------------------
 def tail_file(filepath: str, shutdown: Event):
     """Generator that yields new lines from a file, similar to tail -F."""
-    log.info("Tailing file: %s", filepath)
+    log.info("[file] Tailing file: %s", filepath)
 
     # Wait for file to exist
     while not os.path.exists(filepath) and not shutdown.is_set():
-        log.info("Waiting for log file %s to appear...", filepath)
+        log.info("[file] Waiting for log file %s to appear...", filepath)
         time.sleep(2)
 
     if shutdown.is_set():
@@ -625,6 +638,76 @@ def tail_file(filepath: str, shutdown: Event):
                 time.sleep(0.1)
 
 
+def consume_redis(redis_host: str, redis_key: str, shutdown: Event):
+    """
+    Generator that yields syslog lines from a Redis list via BLPOP.
+
+    Filebeat pushes JSON-encoded events to the Redis list.  Each event
+    looks like: {"@timestamp": "...", "message": "the raw syslog line", ...}
+    We extract the "message" field and yield it as a plain string.
+    """
+    log.info("[redis] Connecting to %s, key=%s", redis_host, redis_key)
+
+    r = None
+    while not shutdown.is_set():
+        try:
+            if r is None:
+                r = redispy.Redis.from_url(redis_host, decode_responses=True)
+                r.ping()
+                log.info("[redis] Connected. Waiting for events on '%s' ...", redis_key)
+                qlen = r.llen(redis_key)
+                if qlen > 0:
+                    log.info("[redis] %d events already queued, processing backlog.", qlen)
+
+            # BLPOP: blocking pop, 1s timeout so we can check shutdown flag
+            result = r.blpop(redis_key, timeout=1)
+            if result is None:
+                # Timeout, no data - loop back and check shutdown
+                continue
+
+            _, raw_data = result
+
+            # Try to parse as Filebeat JSON envelope
+            try:
+                event = json.loads(raw_data)
+                # Filebeat JSON has "message" field with the original log line
+                line = event.get("message", "")
+                if not line:
+                    # Fallback: maybe the whole thing is the log line
+                    line = raw_data
+            except (json.JSONDecodeError, TypeError):
+                # Not JSON - treat as raw syslog line
+                line = raw_data
+
+            if line:
+                yield line
+
+        except redispy.ConnectionError as e:
+            log.warning("[redis] Connection lost: %s. Reconnecting in 5s ...", e)
+            r = None
+            time.sleep(5)
+        except redispy.RedisError as e:
+            log.warning("[redis] Error: %s. Retrying in 2s ...", e)
+            time.sleep(2)
+        except Exception as e:
+            log.error("[redis] Unexpected error: %s. Retrying in 5s ...", e)
+            r = None
+            time.sleep(5)
+
+
+def get_input_source(shutdown: Event):
+    """Return the appropriate input generator based on INPUT_MODE."""
+    if INPUT_MODE == "redis":
+        log.info("Input mode: REDIS (Filebeat -> Redis -> AI)")
+        return consume_redis(REDIS_HOST, REDIS_KEY, shutdown)
+    elif INPUT_MODE == "file":
+        log.info("Input mode: FILE (tailing %s)", LOG_FILE)
+        return tail_file(LOG_FILE, shutdown)
+    else:
+        log.error("Unknown INPUT_MODE: %s (expected 'redis' or 'file')", INPUT_MODE)
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Main processing loop
 # ---------------------------------------------------------------------------
@@ -632,9 +715,14 @@ def main():
     log.info("=" * 60)
     log.info("AI Log Filter PoC - Starting up")
     log.info("=" * 60)
+    log.info("Config: INPUT_MODE=%s", INPUT_MODE)
     log.info("Config: OPENSEARCH_HOST=%s", OPENSEARCH_HOST)
     log.info("Config: OLLAMA_HOST=%s", OLLAMA_HOST)
-    log.info("Config: LOG_FILE=%s", LOG_FILE)
+    if INPUT_MODE == "redis":
+        log.info("Config: REDIS_HOST=%s", REDIS_HOST)
+        log.info("Config: REDIS_KEY=%s", REDIS_KEY)
+    else:
+        log.info("Config: LOG_FILE=%s", LOG_FILE)
     log.info("Config: LLM_MODEL=%s", LLM_MODEL)
     log.info("Config: LLM_ENABLED=%s", LLM_ENABLED)
     log.info("Config: ANOMALY_THRESHOLD=%s", ANOMALY_THRESHOLD)
@@ -669,7 +757,7 @@ def main():
     log.info("Initialization complete. Starting log processing ...")
 
     # --- Main loop ---
-    for line in tail_file(LOG_FILE, shutdown_event):
+    for line in get_input_source(shutdown_event):
         if shutdown_event.is_set():
             break
 

@@ -1,0 +1,72 @@
+# ==========================================================================
+# Filebeat configuration for AI Log Filter PoC
+# ==========================================================================
+#
+# Install on the host server (not in Docker):
+#
+#   sudo cp filebeat.yml /etc/filebeat/filebeat.yml
+#   sudo systemctl restart filebeat
+#
+# This reads /var/log/messages and pushes events to Redis, where the
+# AI service consumes them.
+#
+# Adjust the Redis host if the Docker stack runs on a different machine.
+# ==========================================================================
+
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/messages
+      # Add more paths as needed:
+      # - /var/log/syslog
+      # - /var/log/auth.log
+      # - /var/log/secure
+
+    # Multiline: join stack traces and continuation lines
+    # (disabled by default - enable if your logs have multiline entries)
+    # multiline.pattern: '^\s|^Traceback'
+    # multiline.negate: false
+    # multiline.match: after
+
+    # Fields added to every event
+    fields:
+      source_type: syslog
+    fields_under_root: true
+
+# --- Processors ---
+# Minimal processing - the AI service does the heavy lifting
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  - drop_fields:
+      # Reduce event size - we only need the message and basic metadata
+      fields: ["agent.ephemeral_id", "agent.id", "agent.version", "ecs.version", "log.offset"]
+      ignore_missing: true
+
+# --- Output: Redis ---
+output.redis:
+  hosts: ["localhost:6379"]
+  # Key name must match REDIS_KEY in docker-compose.yml (default: filebeat:logs)
+  key: "filebeat:logs"
+  datatype: list
+  # Codec: json_lines sends one JSON object per event (default)
+  codec.format:
+    string: '%{[message]}'
+  # Bulk size and worker tuning
+  bulk_max_size: 2048
+  worker: 1
+  # Connection
+  timeout: 5s
+  max_retries: 3
+  backoff.init: 1s
+  backoff.max: 60s
+
+# --- Logging ---
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat
+  keepfiles: 3
+  permissions: 0644

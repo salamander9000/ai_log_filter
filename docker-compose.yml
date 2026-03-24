@@ -38,6 +38,23 @@ services:
       opensearch:
         condition: service_healthy
 
+  # --- Redis buffer between Filebeat and AI service ---
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --maxmemory 4gb --maxmemory-policy noeviction --appendonly no --save ""
+    # noeviction = return error when full rather than drop logs
+    # appendonly no + save "" = pure in-memory buffer, no disk persistence
+    ports:
+      - "6379:6379"
+    networks:
+      - lognet
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # --- Ollama for local LLM inference (CPU only) ---
   ollama:
     image: ollama/ollama:latest
@@ -56,7 +73,7 @@ services:
     # No GPU - pure CPU inference
     # Model will be pulled on first run by the AI service
 
-  # --- Synthetic syslog generator (for testing) ---
+  # --- Synthetic syslog generator (demo mode only) ---
   log-generator:
     build:
       context: ./sample-logs
@@ -70,6 +87,8 @@ services:
       - shared-logs:/var/log/synthetic
     networks:
       - lognet
+    profiles:
+      - demo    # only starts with: docker compose --profile demo up
 
   # --- The AI log analysis service ---
   ai-service:
@@ -84,6 +103,11 @@ services:
     environment:
       - OPENSEARCH_HOST=http://opensearch:9200
       - OLLAMA_HOST=http://ollama:11434
+      - REDIS_HOST=redis://redis:6379
+      - REDIS_KEY=filebeat:logs
+      # INPUT_MODE=redis  -> consume from Redis (Filebeat -> Redis -> here)
+      # INPUT_MODE=file   -> tail a log file (synthetic generator / demo)
+      - INPUT_MODE=${INPUT_MODE:-redis}
       - LOG_FILE=/var/log/synthetic/syslog
       - LLM_MODEL=qwen2.5:3b
       - LLM_ENABLED=true
@@ -97,9 +121,9 @@ services:
     depends_on:
       opensearch:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       ollama:
-        condition: service_started
-      log-generator:
         condition: service_started
 
 volumes:
