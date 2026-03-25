@@ -373,8 +373,7 @@ Context:
 - Log template: {template}
 
 Respond in this exact JSON format (no markdown, no extra text):
-{{"threat_category": "<one of: brute_force, privilege_escalation, service_failure, resource_exhaustion, network_anomaly, configuration_error, data_exfiltration, benign_anomaly, unknown>", "severity": "<one of: critical, high, medium, low, info>", "explanation": "<1-2 sentence explanation>", "recommended_action": "<1 sentence recommendation>"}}
-/no_think"""
+{{"threat_category": "<one of: brute_force, privilege_escalation, service_failure, resource_exhaustion, network_anomaly, configuration_error, data_exfiltration, benign_anomaly, unknown>", "severity": "<one of: critical, high, medium, low, info>", "explanation": "<1-2 sentence explanation>", "recommended_action": "<1 sentence recommendation>"}}"""
 
 
 def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
@@ -386,9 +385,10 @@ def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
+                "think": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 256,
+                    "num_predict": 512,
                 },
             },
             timeout=120,
