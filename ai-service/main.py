@@ -41,7 +41,7 @@ import redis as redispy
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "http://localhost:9200")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/syslog")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.5:0.8b")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
 ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.4"))
 TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "5000"))
@@ -59,6 +59,11 @@ LLM_QUEUE_SIZE = int(os.getenv("LLM_QUEUE_SIZE", "10000"))
 # Redis configuration (used when INPUT_MODE=redis)
 REDIS_HOST = os.getenv("REDIS_HOST", "redis://localhost:6379")
 REDIS_KEY = os.getenv("REDIS_KEY", "filebeat:logs")
+
+# Layer 3 integration: push high-severity anomalies to Layer 3 queue
+L3_ENABLED = os.getenv("L3_ENABLED", "true").lower() == "true"
+L3_QUEUE_KEY = os.getenv("L3_QUEUE_KEY", "layer3:queue")
+L3_SEVERITY_FILTER = os.getenv("L3_SEVERITY_FILTER", "high,critical").split(",")
 
 # How many seconds worth of logs to aggregate into a feature window
 FEATURE_WINDOW_SEC = int(os.getenv("FEATURE_WINDOW_SEC", "60"))
@@ -479,11 +484,13 @@ class LLMWorker:
         self,
         os_client: OpenSearch,
         stats: "StatsTracker",
+        redis_client=None,
         num_workers: int = 1,
         queue_size: int = 1000,
     ):
         self.os_client = os_client
         self.stats = stats
+        self.redis_client = redis_client
         self.queue: Queue = Queue(maxsize=queue_size)
         self.num_workers = num_workers
         self.threads: list[Thread] = []
@@ -603,6 +610,30 @@ class LLMWorker:
                     parsed["raw"][:100],
                     llm_result.get("explanation", "")[:80],
                 )
+
+                # Push high-severity events to Layer 3 queue for correlation
+                if (L3_ENABLED and self.redis_client
+                        and llm_result.get("severity", "").lower() in L3_SEVERITY_FILTER):
+                    try:
+                        l3_payload = {
+                            "doc_id": doc_id,
+                            "hostname": parsed["hostname"],
+                            "process": parsed["process"],
+                            "raw": parsed["raw"],
+                            "original_log_line": parsed["raw"],
+                            "message": parsed["message"],
+                            "anomaly_score": score,
+                            "llm_threat_category": llm_result.get("threat_category", "unknown"),
+                            "llm_severity": llm_result.get("severity", "unknown"),
+                            "llm_explanation": llm_result.get("explanation", ""),
+                        }
+                        self.redis_client.rpush(L3_QUEUE_KEY, json.dumps(l3_payload))
+                        log.info("[llm-worker-%d] Pushed to Layer 3 queue: %s/%s",
+                                 worker_id, llm_result.get("threat_category"),
+                                 llm_result.get("severity"))
+                    except Exception as e:
+                        log.warning("[llm-worker-%d] Failed to push to L3 queue: %s", worker_id, e)
+
             else:
                 log.warning("[llm-worker-%d] LLM returned no result for doc %s", worker_id, doc_id)
 
@@ -942,12 +973,24 @@ def main():
     )
     stats = StatsTracker(os_client)
 
+    # --- Redis client for Layer 3 queue ---
+    l3_redis = None
+    if L3_ENABLED:
+        try:
+            l3_redis = redispy.Redis.from_url(REDIS_HOST, decode_responses=True)
+            l3_redis.ping()
+            log.info("Layer 3 queue enabled (key=%s, severity_filter=%s)", L3_QUEUE_KEY, L3_SEVERITY_FILTER)
+        except Exception as e:
+            log.warning("Failed to connect Redis for Layer 3 queue: %s", e)
+            l3_redis = None
+
     # --- Async LLM worker ---
     llm_worker = None
     if llm_available and LLM_ENABLED:
         llm_worker = LLMWorker(
             os_client=os_client,
             stats=stats,
+            redis_client=l3_redis,
             num_workers=LLM_WORKERS,
             queue_size=LLM_QUEUE_SIZE,
         )

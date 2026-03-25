@@ -564,7 +564,7 @@ All settings via environment variables in `docker-compose.yml`:
 | `ANOMALY_THRESHOLD` | `-0.4` | Score cutoff (more negative = stricter) |
 | `TRAINING_WINDOW` | `5000` | Events before first model training |
 | `CONTAMINATION` | `0.01` | Expected anomaly fraction (0.01 = 1%) |
-| `LLM_MODEL` | `qwen3.5:0.8b` | Ollama model name |
+| `LLM_MODEL` | `qwen2.5:3b` | Ollama model name |
 | `LLM_ENABLED` | `true` | Enable/disable LLM layer |
 | `LLM_WORKERS` | `1` | Number of LLM worker threads |
 | `LLM_QUEUE_SIZE` | `10000` | Max queued anomalies for LLM |
