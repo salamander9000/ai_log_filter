@@ -23,7 +23,7 @@ syslog-ng ──TCP:5514──> syslog-receiver ──> Redis ──> AI Service
                         (container)         (buffer)                  + Dashboards
                                                           │
 inject-anomalies.sh ──> /var/log/messages                Ollama (LLM)
-(testing)               ──> syslog-ng (loops back)       Qwen2.5-3B on CPU
+(testing)               ──> syslog-ng (loops back)       Qwen3.5-0.8B on CPU
 ```
 
 ### Real mode - Filebeat
@@ -180,11 +180,11 @@ All configuration is via environment variables in `docker-compose.yml` or `.env`
 | `LOG_FILE` | `/var/log/synthetic/syslog` | Log file to tail (when INPUT_MODE=file) |
 | `OPENSEARCH_HOST` | `http://opensearch:9200` | OpenSearch endpoint |
 | `OLLAMA_HOST` | `http://ollama:11434` | Ollama endpoint |
-| `LLM_MODEL` | `qwen2.5:3b` | Ollama model name |
+| `LLM_MODEL` | `qwen3.5:0.8b` | Ollama model name |
 | `LLM_ENABLED` | `true` | Enable/disable LLM analysis |
-| `ANOMALY_THRESHOLD` | `-0.3` | Isolation Forest anomaly threshold (more negative = stricter) |
-| `TRAINING_WINDOW` | `1000` | Number of events before first model training |
-| `CONTAMINATION` | `0.02` | Expected fraction of anomalies in the data (0.02 = 2%) |
+| `ANOMALY_THRESHOLD` | `-0.4` | Isolation Forest anomaly threshold (more negative = stricter) |
+| `TRAINING_WINDOW` | `5000` | Number of events before first model training |
+| `CONTAMINATION` | `0.01` | Expected fraction of anomalies in the data (0.01 = 1%) |
 | `BATCH_SIZE` | `50` | OpenSearch bulk indexing batch size |
 
 ### Log Generator (demo mode only)
@@ -248,10 +248,10 @@ docker compose down -v
 
 ## Tuning Tips
 
-- **Too many false positives?** Lower `ANOMALY_THRESHOLD` (e.g., `-0.4`). Increase `TRAINING_WINDOW`. Lower `CONTAMINATION` (e.g., `0.01`).
-- **Missing real anomalies?** Raise `ANOMALY_THRESHOLD` (e.g., `-0.15`). Raise `CONTAMINATION` (e.g., `0.05`).
-- **LLM too slow?** Try `qwen2.5:1.5b` for faster inference, or set `LLM_ENABLED=false` to run ML-only.
-- **Want a larger/smarter LLM?** Try `qwen2.5:7b` if you have enough RAM (~8GB for the model).
+- **Too many false positives?** Lower `ANOMALY_THRESHOLD` (e.g., `-0.5`). Increase `TRAINING_WINDOW` (e.g., `10000`). Lower `CONTAMINATION` (e.g., `0.005`).
+- **Missing real anomalies?** Raise `ANOMALY_THRESHOLD` (e.g., `-0.2`). Raise `CONTAMINATION` (e.g., `0.03`).
+- **LLM too slow?** The default `qwen3.5:0.8b` is already very fast. If still too slow, set `LLM_ENABLED=false` to run ML-only.
+- **Want better LLM quality?** Try `qwen3.5:2b` or `qwen3.5:9b` if you have enough RAM. Larger models give more accurate threat classification at the cost of throughput.
 - **Redis queue growing?** Increase `BATCH_SIZE`, or set `LLM_ENABLED=false` to speed up processing.
 
 ## What This PoC Demonstrates

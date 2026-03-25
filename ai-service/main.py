@@ -41,12 +41,12 @@ import redis as redispy
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "http://localhost:9200")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/syslog")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.5:0.8b")
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
-ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.3"))
-TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "1000"))
+ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.4"))
+TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "5000"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-CONTAMINATION = float(os.getenv("CONTAMINATION", "0.02"))
+CONTAMINATION = float(os.getenv("CONTAMINATION", "0.01"))
 
 # Input mode: "redis" or "file"
 INPUT_MODE = os.getenv("INPUT_MODE", "redis")
@@ -54,7 +54,7 @@ INPUT_MODE = os.getenv("INPUT_MODE", "redis")
 # Number of LLM worker threads (async analysis of flagged events)
 LLM_WORKERS = int(os.getenv("LLM_WORKERS", "1"))
 # Max LLM queue size (drop oldest if full to avoid unbounded memory)
-LLM_QUEUE_SIZE = int(os.getenv("LLM_QUEUE_SIZE", "1000"))
+LLM_QUEUE_SIZE = int(os.getenv("LLM_QUEUE_SIZE", "10000"))
 
 # Redis configuration (used when INPUT_MODE=redis)
 REDIS_HOST = os.getenv("REDIS_HOST", "redis://localhost:6379")
@@ -194,15 +194,18 @@ class FeatureExtractor:
     """
     Extracts numeric features from parsed log events for anomaly detection.
 
+    All features are bounded (0-1 or small fixed range) so the model
+    behaves consistently regardless of how long the service has been running.
+
     Features per event:
-    1. message_length        - length of log message
+    1. message_length        - length of log message (chars)
     2. severity_level        - numeric severity (0=emerg .. 7=debug)
-    3. suspicious_score      - max score from pattern matching
-    4. template_id           - hash of the Drain3 template (numeric)
-    5. template_frequency    - how often we've seen this template recently
+    3. suspicious_score      - max score from regex pattern matching (0-1)
+    4. template_id_hash      - hash of the Drain3 template (0-9999)
+    5. template_rarity       - 1/count, capped at 1.0 (rare=high, common=low)
     6. hour_of_day           - 0-23
-    7. process_frequency     - how often this process appears recently
-    8. is_new_template       - 1 if template was never seen before
+    7. process_ratio          - process count / total events (0-1)
+    8. msg_word_count         - number of words in the message
     """
 
     def __init__(self, template_miner: TemplateMiner):
@@ -222,18 +225,19 @@ class FeatureExtractor:
         template_id = result["cluster_id"] if result else 0
         template_str = result["template_mined"] if result else msg
 
-        # Template frequency
+        # Template frequency and rarity
         self.template_counts[template_id] += 1
         template_freq = self.template_counts[template_id]
+        template_rarity = min(1.0, 1.0 / template_freq)  # bounded 0-1
 
-        # New template?
-        is_new = 1 if template_id not in self.seen_templates else 0
+        # Track seen templates (for metadata only, not as a feature)
+        is_new = template_id not in self.seen_templates
         self.seen_templates.add(template_id)
 
-        # Process frequency
+        # Process ratio (normalized, bounded 0-1)
         proc = parsed.get("process", "unknown")
         self.process_counts[proc] += 1
-        proc_freq = self.process_counts[proc]
+        process_ratio = self.process_counts[proc] / self.total_events
 
         # Severity
         severity_name, severity_level = detect_severity(msg)
@@ -249,15 +253,18 @@ class FeatureExtractor:
         # Numeric template_id hash (make it a bounded int)
         tid_hash = int(hashlib.md5(str(template_id).encode()).hexdigest()[:8], 16) % 10000
 
+        # Word count (structural dimension - anomalous messages often have unusual word counts)
+        msg_word_count = len(msg.split())
+
         features = np.array([
             len(msg),                     # message_length
             severity_level,               # severity_level
             max_suspicious_score,         # suspicious_score
             tid_hash,                     # template_id_hash
-            template_freq,                # template_frequency
+            template_rarity,              # template_rarity (1/count, bounded 0-1)
             hour,                         # hour_of_day
-            proc_freq,                    # process_frequency
-            is_new,                       # is_new_template
+            process_ratio,                # process_ratio (count/total, bounded 0-1)
+            msg_word_count,               # msg_word_count
         ], dtype=np.float64)
 
         metadata = {
@@ -366,7 +373,8 @@ Context:
 - Log template: {template}
 
 Respond in this exact JSON format (no markdown, no extra text):
-{{"threat_category": "<one of: brute_force, privilege_escalation, service_failure, resource_exhaustion, network_anomaly, configuration_error, data_exfiltration, benign_anomaly, unknown>", "severity": "<one of: critical, high, medium, low, info>", "explanation": "<1-2 sentence explanation>", "recommended_action": "<1 sentence recommendation>"}}"""
+{{"threat_category": "<one of: brute_force, privilege_escalation, service_failure, resource_exhaustion, network_anomaly, configuration_error, data_exfiltration, benign_anomaly, unknown>", "severity": "<one of: critical, high, medium, low, info>", "explanation": "<1-2 sentence explanation>", "recommended_action": "<1 sentence recommendation>"}}
+/no_think"""
 
 
 def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
@@ -388,12 +396,20 @@ def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
         resp.raise_for_status()
         text = resp.json().get("response", "")
 
+        # Strip thinking blocks (Qwen3/3.5 may include <think>...</think>)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
         # Try to extract JSON from the response
         # Sometimes LLMs wrap in ```json ... ```
         text = text.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
+
+        # Try to extract JSON object if there's extra text around it
+        json_match = re.search(r"\{[^{}]*\}", text)
+        if json_match:
+            text = json_match.group(0)
 
         return json.loads(text)
     except requests.exceptions.ConnectionError:
@@ -492,7 +508,8 @@ class LLMWorker:
     def submit(self, doc_id: str, parsed: dict, metadata: dict, score: float):
         """
         Submit an anomalous event for LLM analysis.
-        Non-blocking: drops the event if the queue is full.
+        Non-blocking: if the queue is full, marks the doc as llm_skipped=true
+        in OpenSearch so the dashboard can distinguish pending from skipped.
         """
         task = {
             "doc_id": doc_id,
@@ -504,6 +521,15 @@ class LLMWorker:
             self.queue.put_nowait(task)
         except Exception:
             self._dropped += 1
+            # Mark the document as skipped in OpenSearch
+            try:
+                self.os_client.update(
+                    index=IDX_ANOMALIES,
+                    id=doc_id,
+                    body={"doc": {"llm_skipped": True}},
+                )
+            except Exception:
+                pass  # best effort - don't block the main loop
             if self._dropped % 100 == 1:
                 log.warning(
                     "LLM queue full (size=%d), dropped %d events so far",
@@ -662,6 +688,7 @@ def setup_indices(client: OpenSearch):
                 "llm_recommended_action": {"type": "text"},
                 "llm_raw_response": {"type": "text"},
                 "llm_analyzed": {"type": "boolean"},
+                "llm_skipped": {"type": "boolean"},
             }
         },
         "settings": processed_mapping["settings"],

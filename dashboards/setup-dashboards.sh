@@ -133,7 +133,7 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
         "uiStateJSON": "{}",
         "description": "Number of anomalies not yet analyzed by the LLM",
         "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"llm_analyzed:false\",\"language\":\"kuery\"},\"filter\":[]}"
+            "searchSourceJSON": "{\"index\":\"logs-anomalies\",\"query\":{\"query\":\"llm_analyzed:false AND NOT llm_skipped:true\",\"language\":\"kuery\"},\"filter\":[]}"
         }
     }
 }

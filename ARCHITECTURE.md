@@ -88,9 +88,9 @@ log analysis on CPU-only hardware before investing in GPU infrastructure?"**
     ┌───────────────────────────────────────────────────────────────┐
     │                       Ollama                                   │
     │                                                               │
-    │   Qwen2.5-3B (quantized, CPU inference)                       │
-    │   ~15-30 tokens/sec on Xeon/EPYC                              │
-    │   ~5-30 seconds per event analysis                             │
+    │   Qwen3.5-0.8B (quantized, CPU inference)                      │
+    │   ~60-120 tokens/sec on modern CPUs                            │
+    │   ~2-10 seconds per event analysis                             │
     └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -124,7 +124,7 @@ Redis absorbs backpressure.
 Standard Redis 7 running as a pure in-memory FIFO queue.
 
 **Configuration:**
-- `maxmemory 4gb` - caps memory usage (adjustable for your 256GB server)
+- `maxmemory 4gb` - caps memory usage (increase if the server has ample RAM)
 - `maxmemory-policy noeviction` - returns error when full rather than
   silently dropping messages
 - No persistence (`appendonly no`, `save ""`) - pure speed, no disk I/O
@@ -137,8 +137,8 @@ Standard Redis 7 running as a pure in-memory FIFO queue.
 
 **Why Redis?** It provides backpressure buffering. If the AI service restarts,
 crashes, or falls behind (especially during LLM analysis), messages queue
-safely in RAM rather than being lost. With 256GB of server RAM, you can
-buffer millions of events.
+safely in RAM rather than being lost. On servers with ample RAM, you can
+increase the Redis `maxmemory` to buffer millions of events.
 
 ### 3. AI Service - Main Thread (`ai-service/main.py`)
 
@@ -177,21 +177,24 @@ the Isolation Forest model:
 
 ```
 Feature Vector: [msg_len, severity, suspicious_score, template_hash,
-                 template_freq, hour_of_day, process_freq, is_new_template]
+                 template_rarity, hour_of_day, process_ratio, msg_word_count]
 ```
+
+All features are bounded or naturally constrained, so the model behaves
+consistently regardless of how long the service has been running.
 
 **Feature details:**
 
-| # | Feature | Source | Rationale |
-|---|---------|--------|-----------|
-| 1 | `message_length` | `len(message)` | Anomalous events often have unusual lengths (stack traces, binary data, very long error messages) |
-| 2 | `severity_level` | Keyword scan (0-7) | Scans for keywords like "emerg", "crit", "error", "warning" in the message text. Lower number = more severe. |
-| 3 | `suspicious_score` | Regex patterns (0.0-1.0) | 15 compiled regex patterns match known suspicious content: "failed password" (0.7), "out of memory" (0.9), "segfault" (0.8), "kernel panic" (1.0), etc. Returns the max match score. This is a **heuristic booster**, not the decision maker. |
-| 4 | `template_id_hash` | Drain3 + MD5 | Drain3 clusters similar messages into templates (e.g., "Failed password for `<*>` from `<*>` port `<*>` ssh2"). The template ID is hashed to a bounded integer. Groups similar messages together. |
-| 5 | `template_frequency` | Counter | How many times this specific template has been seen so far. High-frequency templates are "normal noise" (cron jobs, health checks). Low-frequency templates are unusual. |
-| 6 | `hour_of_day` | Timestamp parse (0-23) | Some events are normal at 10 AM but suspicious at 3 AM (e.g., SSH logins, batch jobs). |
-| 7 | `process_frequency` | Counter | How often this process name has appeared. A suddenly new process is noteworthy. |
-| 8 | `is_new_template` | Boolean (0/1) | Set to 1 the **first time** a log template is ever seen. Completely novel log patterns are inherently suspicious - they indicate something new is happening on the system. |
+| # | Feature | Source | Range | Rationale |
+|---|---------|--------|-------|-----------|
+| 1 | `message_length` | `len(message)` | 0-∞ | Anomalous events often have unusual lengths (stack traces, binary data, very long error messages) |
+| 2 | `severity_level` | Keyword scan | 0-7 | Scans for keywords like "emerg", "crit", "error", "warning" in the message text. Lower number = more severe. |
+| 3 | `suspicious_score` | Regex patterns | 0.0-1.0 | 15 compiled regex patterns match known suspicious content: "failed password" (0.7), "out of memory" (0.9), "segfault" (0.8), "kernel panic" (1.0), etc. Returns the max match score. This is a **heuristic booster**, not the decision maker. |
+| 4 | `template_id_hash` | Drain3 + MD5 | 0-9999 | Drain3 clusters similar messages into templates (e.g., "Failed password for `<*>` from `<*>` port `<*>` ssh2"). The template ID is hashed to a bounded integer. Groups similar messages together. |
+| 5 | `template_rarity` | `1 / template_count` | 0.0-1.0 | Inverse of how often this template has been seen. Rare templates (seen once = 1.0) score high, common templates (seen 1000 times = 0.001) score near zero. Better than raw frequency counts which grow unboundedly over time. |
+| 6 | `hour_of_day` | Timestamp parse | 0-23 | Some events are normal at 10 AM but suspicious at 3 AM (e.g., SSH logins, batch jobs). |
+| 7 | `process_ratio` | `count / total_events` | 0.0-1.0 | Normalized frequency of this process name relative to all events. A process that appears in 50% of logs vs one that appears in 0.01% provides a bounded signal. |
+| 8 | `msg_word_count` | `len(msg.split())` | 0-∞ | Number of words in the message. Provides a structural dimension different from `message_length` (character count) - anomalous messages like stack traces have many words, while binary data or short alerts have few. |
 
 **Drain3 Log Template Mining (`main.py:177-187`):**
 
@@ -249,30 +252,34 @@ The **anomaly score** is derived from the average path length across all
 
 **Training cycle (`main.py:331-349`):**
 
-1. The model collects the first `TRAINING_WINDOW` events (default: 1000)
+1. The model collects the first `TRAINING_WINDOW` events (default: 5000)
    into a buffer. During this warmup, a simple heuristic is used instead:
    if `suspicious_score > 0.3`, flag it.
-2. After 1000 events, `StandardScaler` normalizes the features (zero mean,
-   unit variance) and the Isolation Forest fits on the data.
+2. After 5000 events, `StandardScaler` normalizes the features (zero mean,
+   unit variance) and the Isolation Forest fits on the data. A larger
+   training window captures more diversity in "normal" log traffic, which
+   is critical for environments with many different log sources.
 3. The model retrains every `TRAINING_WINDOW` events (rolling window of
    2x the training window size) to adapt to changing log patterns.
-4. The `contamination` parameter (default: 0.02) tells the model to expect
-   ~2% of events to be anomalous. This affects the internal decision boundary.
+4. The `contamination` parameter (default: 0.01) tells the model to expect
+   ~1% of events to be anomalous. This affects the internal decision boundary.
+   Setting this too high (e.g., 0.05) forces the model to flag normal-but-diverse
+   events to fill the anomaly quota.
 
 **Decision threshold (`main.py:328`):**
 
 After scoring, an event is flagged as anomalous if:
 ```
-score < ANOMALY_THRESHOLD  (default: -0.3)
+score < ANOMALY_THRESHOLD  (default: -0.4)
 ```
 
 **Tuning parameters:**
 
 | Parameter | Default | Effect of increasing | Effect of decreasing |
 |-----------|---------|---------------------|---------------------|
-| `ANOMALY_THRESHOLD` | `-0.3` | More events flagged (more sensitive) | Fewer events flagged (stricter) |
-| `TRAINING_WINDOW` | `1000` | Better baseline but slower to start | Faster start but narrower baseline |
-| `CONTAMINATION` | `0.02` | Model expects more anomalies, flags more | Model expects fewer anomalies, flags less |
+| `ANOMALY_THRESHOLD` | `-0.4` | More events flagged (more sensitive) | Fewer events flagged (stricter) |
+| `TRAINING_WINDOW` | `5000` | Better baseline but slower to start | Faster start but narrower baseline |
+| `CONTAMINATION` | `0.01` | Model expects more anomalies, flags more | Model expects fewer anomalies, flags less |
 
 **Why these particular features and this model?**
 
@@ -284,8 +291,8 @@ Isolation Forest was chosen because:
 - Naturally adapts to whatever "normal" looks like in your environment
 
 The 8 features were chosen to capture different dimensions of "unusual":
-temporal (hour_of_day), structural (template_id, is_new_template), frequency
-(template_frequency, process_frequency), semantic (severity, suspicious_score),
+temporal (hour_of_day), structural (template_id_hash, msg_word_count), rarity
+(template_rarity, process_ratio), semantic (severity, suspicious_score),
 and physical (message_length).
 
 #### Step 5: Indexing (`main.py:970-989`)
@@ -313,7 +320,7 @@ Main Thread                    LLM Worker Thread
                                
 anomaly detected ──> Queue ──> BLPOP from queue
                     (bounded   │
-                     1000      ▼
+                     10000     ▼
                      items)    Build prompt with:
                                 - raw log line
                                 - hostname, process
@@ -360,37 +367,44 @@ The prompt provides the LLM with:
 **Queue overflow handling:**
 
 If the LLM can't keep up and the queue reaches `LLM_QUEUE_SIZE` (default:
-1000), new anomalies are dropped from the queue (logged with a warning).
-The events are still in OpenSearch as `llm_analyzed=false` - they just
-don't get the LLM enrichment.
+10000), new anomalies are dropped from the queue. When dropped, the
+OpenSearch document is updated with `llm_skipped=true` so the dashboard
+can distinguish "genuinely pending" from "permanently skipped" events.
 
-**Why async?** On CPU, the LLM processes ~2-12 events per minute. If 2% of
-incoming events are anomalous and you receive 10 events/sec, that's ~12
-anomalies/minute - roughly matching the LLM capacity. Without async,
-every LLM call (5-30 seconds) would stall the main loop, causing the
-Redis input queue to grow and Layer 1 to fall behind.
+**Why async?** On CPU, even small LLMs take seconds per event. If 1% of
+incoming events are anomalous and you receive 10 events/sec, that's ~6
+anomalies/minute. Without async, every LLM call would stall the main
+loop, causing the Redis input queue to grow and Layer 1 to fall behind.
 
 ### 5. Ollama (LLM Runtime)
 
 Ollama manages the local LLM model. It handles model loading, memory
 management, and inference.
 
-**Model:** Qwen2.5-3B-Instruct (Q4_K_M quantization)
-- 3 billion parameters
-- ~2GB disk / ~3GB RAM
-- ~15-30 tokens/sec on modern Xeon/EPYC
-- Good at structured output (JSON), instruction following, and reasoning
+**Default model:** Qwen3.5-0.8B (quantized)
+- 0.8 billion parameters
+- ~1GB disk / ~1.5GB RAM
+- ~60-120 tokens/sec on modern CPUs
+- Native structured output (JSON) and tool calling support
+- Thinking mode disabled via `/no_think` prompt suffix for speed
 
 **Why this model?**
-- Small enough to run on CPU at usable speeds
-- Large enough to understand security context and provide meaningful analysis
-- Quantized (Q4_K_M) to reduce memory footprint and speed up inference
-- Qwen2.5 family has strong performance on reasoning benchmarks at this size
+- Small enough to run fast on CPU (~2-10 seconds per event)
+- Qwen3.5 family has strong structured output capabilities at every size
+- Much faster than 3B+ models while still providing useful classification
+- Thinking mode can be disabled to avoid wasting tokens on internal reasoning
+
+**Thinking mode:** Qwen3/3.5 models support a "thinking" mode that wraps
+internal reasoning in `<think>...</think>` blocks. For our use case, thinking
+wastes CPU cycles generating tokens we don't need. The prompt includes
+`/no_think` to disable this, and the response parser strips any `<think>`
+blocks as a fallback.
 
 **Alternatives:**
-- `qwen2.5:1.5b` - faster but less accurate
-- `qwen2.5:7b` - more accurate but needs ~8GB RAM, slower on CPU
-- `phi-3-mini` - comparable quality, different strengths
+- `qwen3.5:2b` - better accuracy, ~2-3x slower
+- `qwen3.5:9b` - significantly more accurate, needs ~8GB RAM
+- `ministral-3:3b` - strong structured output, newer Mistral architecture
+- `qwen2.5:3b` - previous default, good quality but slower on CPU
 
 ### 6. OpenSearch + Dashboards
 
@@ -493,10 +507,10 @@ Redis -> AI service, testing the full pipeline end-to-end.
 
 5. Feature extraction produces 8-dimensional vector
    └── [msg_len, severity, suspicious_score, template_hash,
-        template_freq, hour, process_freq, is_new]
+        template_rarity, hour, process_ratio, msg_word_count]
 
 6. Isolation Forest scores the vector
-   ├── score > ANOMALY_THRESHOLD (-0.3) -> normal (95-99% of events)
+   ├── score > ANOMALY_THRESHOLD (-0.4) -> normal (95-99% of events)
    │   └── Index to logs-processed only
    └── score < ANOMALY_THRESHOLD -> ANOMALY (1-5% of events)
        ├── Index to logs-processed
@@ -527,16 +541,16 @@ Redis -> AI service, testing the full pipeline end-to-end.
 | Feature extraction | Thousands/sec | ~microseconds | No |
 | Isolation Forest scoring | Thousands/sec | ~microseconds | No |
 | OpenSearch bulk indexing | Hundreds/sec | ~10ms per batch | No |
-| **LLM inference (CPU)** | **2-12/min** | **5-30 sec** | **YES** |
+| **LLM inference (CPU)** | **6-30/min** | **2-10 sec** | **YES** |
 
 The LLM is the only bottleneck, which is why:
 1. It runs asynchronously in a background thread
-2. Only ~2% of events reach it (after Isolation Forest filtering)
-3. A bounded queue prevents memory exhaustion
+2. Only ~1% of events reach it (after Isolation Forest filtering)
+3. A bounded queue (10000) with `llm_skipped` tracking prevents memory exhaustion
 4. The dashboard shows events immediately from Layer 1, LLM results appear later
 
-**PoC metric to extract:** "With GPU (e.g., RTX 4090), LLM throughput would
-increase from ~10/min to ~600/min (60x), handling a much higher anomaly rate."
+**PoC metric to extract:** "With GPU, LLM throughput would increase
+dramatically, handling a much higher anomaly rate and enabling larger models."
 
 ---
 
@@ -547,13 +561,13 @@ All settings via environment variables in `docker-compose.yml`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INPUT_MODE` | `redis` | `redis` or `file` |
-| `ANOMALY_THRESHOLD` | `-0.3` | Score cutoff (more negative = stricter) |
-| `TRAINING_WINDOW` | `1000` | Events before first model training |
-| `CONTAMINATION` | `0.02` | Expected anomaly fraction (0.02 = 2%) |
-| `LLM_MODEL` | `qwen2.5:3b` | Ollama model name |
+| `ANOMALY_THRESHOLD` | `-0.4` | Score cutoff (more negative = stricter) |
+| `TRAINING_WINDOW` | `5000` | Events before first model training |
+| `CONTAMINATION` | `0.01` | Expected anomaly fraction (0.01 = 1%) |
+| `LLM_MODEL` | `qwen3.5:0.8b` | Ollama model name |
 | `LLM_ENABLED` | `true` | Enable/disable LLM layer |
 | `LLM_WORKERS` | `1` | Number of LLM worker threads |
-| `LLM_QUEUE_SIZE` | `1000` | Max queued anomalies for LLM |
+| `LLM_QUEUE_SIZE` | `10000` | Max queued anomalies for LLM |
 | `BATCH_SIZE` | `50` | OpenSearch bulk batch size |
 
 ---

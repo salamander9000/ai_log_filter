@@ -133,13 +133,13 @@ services:
       # INPUT_MODE=file   -> tail a log file (synthetic generator / demo)
       - INPUT_MODE=${INPUT_MODE:-redis}
       - LOG_FILE=/var/log/synthetic/syslog
-      - LLM_MODEL=qwen2.5:3b
+      - LLM_MODEL=qwen3.5:0.8b
       - LLM_ENABLED=true
       - LLM_WORKERS=1
-      - LLM_QUEUE_SIZE=1000
-      - "ANOMALY_THRESHOLD=-0.3"
-      - TRAINING_WINDOW=1000
-      - CONTAMINATION=0.02
+      - LLM_QUEUE_SIZE=10000
+      - "ANOMALY_THRESHOLD=-0.4"
+      - TRAINING_WINDOW=5000
+      - CONTAMINATION=0.01
       - BATCH_SIZE=50
     volumes:
       - shared-logs:/var/log/synthetic:ro
