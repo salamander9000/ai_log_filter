@@ -1064,12 +1064,13 @@ def main():
             anomaly_doc = dict(doc)
             anomaly_doc["llm_analyzed"] = False
 
-            # Index to anomalies immediately (without LLM results)
-            bulk_buffer.append({
-                "_index": IDX_ANOMALIES,
-                "_id": doc_id,
-                "_source": anomaly_doc,
-            })
+            # Index anomaly doc directly (not via bulk buffer) so it exists
+            # in OpenSearch BEFORE the LLM worker tries to update it.
+            # With fast models the worker can finish before bulk flush.
+            try:
+                os_client.index(index=IDX_ANOMALIES, id=doc_id, body=anomaly_doc)
+            except Exception as e:
+                log.warning("Failed to index anomaly doc %s: %s", doc_id[:12], e)
 
             log.info("ANOMALY [score=%.3f] %s", score, parsed["raw"][:120])
 
