@@ -343,7 +343,9 @@ def query_correlated_events(es_client: Elasticsearch, anomaly: dict,
 # ---------------------------------------------------------------------------
 def query_llm(prompt: str) -> dict | None:
     """Send prompt to Ollama via HAProxy and parse JSON response."""
+    text = ""
     try:
+        log.debug("Sending L3 LLM request to %s model=%s", OLLAMA_HOST, L3_LLM_MODEL)
         resp = requests.post(
             f"{OLLAMA_HOST}/api/generate",
             json={
@@ -359,7 +361,19 @@ def query_llm(prompt: str) -> dict | None:
             timeout=300,  # 5 min timeout for larger context
         )
         resp.raise_for_status()
-        text = resp.json().get("response", "")
+        raw_resp = resp.json()
+        text = raw_resp.get("response", "")
+        thinking = raw_resp.get("thinking", "")
+
+        if thinking and not text:
+            log.warning("L3 LLM spent all tokens on thinking (%d chars), no response. "
+                        "Model may not support think:false.", len(thinking))
+            return None
+
+        if not text:
+            log.warning("L3 LLM returned empty response (eval_count=%s)",
+                        raw_resp.get("eval_count", "?"))
+            return None
 
         # Strip thinking blocks
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -370,20 +384,28 @@ def query_llm(prompt: str) -> dict | None:
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
 
-        # Extract JSON object
-        json_match = re.search(r"\{[^{}]*\}", text)
-        if json_match:
-            text = json_match.group(0)
+        # Extract JSON object - use greedy match to handle nested braces
+        # Find the first { and the last } to capture the full JSON object
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            text = text[first_brace:last_brace + 1]
 
-        return json.loads(text)
-    except requests.exceptions.ConnectionError:
-        log.warning("Ollama/HAProxy not reachable at %s", OLLAMA_HOST)
+        result = json.loads(text)
+        log.debug("L3 LLM parsed successfully: confirmed=%s, attack_type=%s",
+                  result.get("confirmed"), result.get("attack_type"))
+        return result
+    except requests.exceptions.ConnectionError as e:
+        log.warning("Ollama/HAProxy not reachable at %s: %s", OLLAMA_HOST, e)
         return None
-    except (json.JSONDecodeError, KeyError) as e:
-        log.warning("Failed to parse LLM response: %s (response: %.300s)", e, text if 'text' in dir() else 'N/A')
+    except requests.exceptions.HTTPError as e:
+        log.warning("Ollama returned HTTP error: %s", e)
+        return None
+    except json.JSONDecodeError as e:
+        log.warning("Failed to parse L3 LLM JSON: %s (response: %.500s)", e, text)
         return None
     except Exception as e:
-        log.warning("LLM query failed: %s", e)
+        log.warning("L3 LLM query failed: %s", e, exc_info=True)
         return None
 
 

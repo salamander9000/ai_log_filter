@@ -383,6 +383,7 @@ Respond in this exact JSON format (no markdown, no extra text):
 
 def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
     """Send a prompt to Ollama and parse the JSON response."""
+    text = ""
     try:
         resp = requests.post(
             f"{OLLAMA_HOST}/api/generate",
@@ -399,7 +400,17 @@ def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
             timeout=120,
         )
         resp.raise_for_status()
-        text = resp.json().get("response", "")
+        raw_resp = resp.json()
+        text = raw_resp.get("response", "")
+        thinking = raw_resp.get("thinking", "")
+
+        if thinking and not text:
+            log.warning("LLM spent all tokens on thinking (%d chars), no response.", len(thinking))
+            return None
+
+        if not text:
+            log.warning("LLM returned empty response (eval_count=%s)", raw_resp.get("eval_count", "?"))
+            return None
 
         # Strip thinking blocks (Qwen3/3.5 may include <think>...</think>)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -411,17 +422,18 @@ def query_ollama(prompt: str, model: str = LLM_MODEL) -> dict | None:
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
 
-        # Try to extract JSON object if there's extra text around it
-        json_match = re.search(r"\{[^{}]*\}", text)
-        if json_match:
-            text = json_match.group(0)
+        # Extract JSON object - find first { to last } to handle nested braces
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            text = text[first_brace:last_brace + 1]
 
         return json.loads(text)
     except requests.exceptions.ConnectionError:
         log.warning("Ollama not reachable at %s", OLLAMA_HOST)
         return None
-    except (json.JSONDecodeError, KeyError) as e:
-        log.warning("Failed to parse LLM response: %s (response: %.200s)", e, text)
+    except json.JSONDecodeError as e:
+        log.warning("Failed to parse LLM response: %s (response: %.500s)", e, text)
         return None
     except Exception as e:
         log.warning("Ollama query failed: %s", e)
