@@ -281,7 +281,24 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
 ENDJSON
 create_object "visualization" "viz-anomaly-rate" "${TMPDIR}/body.json"
 
-# ==== LAYER 3: Confirmed Threats ====
+# ==== LAYER 3: Threat Correlation ====
+
+# Viz: L3 Total Analyzed (metric - all events L3 has processed)
+echo "Creating: L3 Total Analyzed"
+cat > "${TMPDIR}/body.json" <<'ENDJSON'
+{
+    "attributes": {
+        "title": "L3 Analyzed (Total)",
+        "visState": "{\"title\":\"L3 Analyzed (Total)\",\"type\":\"metric\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}],\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"invertColors\":false,\"style\":{\"bgFill\":\"#000\",\"bgColor\":false,\"labelColor\":false,\"subText\":\"events correlated by L3\",\"fontSize\":48}}}}",
+        "uiStateJSON": "{}",
+        "description": "Total number of events Layer 3 has analyzed (confirmed + not confirmed)",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-threats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+        }
+    }
+}
+ENDJSON
+create_object "visualization" "viz-l3-total-analyzed" "${TMPDIR}/body.json"
 
 # Viz: Confirmed Threats count (metric)
 echo "Creating: Confirmed Threats (L3)"
@@ -289,7 +306,7 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
 {
     "attributes": {
         "title": "Confirmed Threats (L3)",
-        "visState": "{\"title\":\"Confirmed Threats (L3)\",\"type\":\"metric\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}],\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"invertColors\":false,\"style\":{\"bgFill\":\"#000\",\"bgColor\":false,\"labelColor\":false,\"subText\":\"confirmed threats\",\"fontSize\":60}}}}",
+        "visState": "{\"title\":\"Confirmed Threats (L3)\",\"type\":\"metric\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"}],\"params\":{\"addTooltip\":true,\"addLegend\":false,\"type\":\"metric\",\"metric\":{\"percentageMode\":false,\"useRanges\":false,\"colorSchema\":\"Green to Red\",\"metricColorMode\":\"None\",\"colorsRange\":[{\"from\":0,\"to\":10000}],\"labels\":{\"show\":true},\"invertColors\":false,\"style\":{\"bgFill\":\"#000\",\"bgColor\":false,\"labelColor\":false,\"subText\":\"confirmed threats\",\"fontSize\":48}}}}",
         "uiStateJSON": "{}",
         "description": "Number of confirmed threats from Layer 3 correlation",
         "kibanaSavedObjectMeta": {
@@ -300,6 +317,23 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
 ENDJSON
 create_object "visualization" "viz-confirmed-threats" "${TMPDIR}/body.json"
 
+# Viz: L3 Confirmed vs Not (horizontal bar)
+echo "Creating: L3 Confirmed vs Not Confirmed"
+cat > "${TMPDIR}/body.json" <<'ENDJSON'
+{
+    "attributes": {
+        "title": "L3: Confirmed vs Not Confirmed",
+        "visState": "{\"title\":\"L3: Confirmed vs Not Confirmed\",\"type\":\"horizontal_bar\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"confirmed\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":2},\"schema\":\"segment\"}],\"params\":{\"type\":\"horizontal_bar\",\"grid\":{\"categoryLines\":false},\"categoryAxes\":[{\"id\":\"CategoryAxis-1\",\"type\":\"category\",\"position\":\"left\",\"show\":true,\"labels\":{\"show\":true},\"title\":{}}],\"valueAxes\":[{\"id\":\"ValueAxis-1\",\"name\":\"BottomAxis-1\",\"type\":\"value\",\"position\":\"bottom\",\"show\":true,\"labels\":{\"show\":true},\"title\":{\"text\":\"Count\"}}],\"seriesParams\":[{\"show\":true,\"type\":\"histogram\",\"mode\":\"normal\",\"data\":{\"label\":\"Count\",\"id\":\"1\"},\"valueAxis\":\"ValueAxis-1\"}],\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\"}}",
+        "uiStateJSON": "{}",
+        "description": "Layer 3 results split by confirmed (true threat) vs not confirmed (false positive)",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"index\":\"logs-threats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+        }
+    }
+}
+ENDJSON
+create_object "visualization" "viz-l3-confirmed-vs-not" "${TMPDIR}/body.json"
+
 # Viz: L3 Attack Types (pie)
 echo "Creating: Attack Types (L3)"
 cat > "${TMPDIR}/body.json" <<'ENDJSON'
@@ -308,7 +342,7 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
         "title": "Attack Types (L3)",
         "visState": "{\"title\":\"Attack Types (L3)\",\"type\":\"pie\",\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"params\":{},\"schema\":\"metric\"},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"params\":{\"field\":\"attack_type\",\"orderBy\":\"1\",\"order\":\"desc\",\"size\":10},\"schema\":\"segment\"}],\"params\":{\"type\":\"pie\",\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true,\"labels\":{\"show\":true,\"values\":true,\"last_level\":true,\"truncate\":100}}}",
         "uiStateJSON": "{}",
-        "description": "Layer 3 confirmed attack type breakdown",
+        "description": "Layer 3 attack type breakdown (all analyzed events)",
         "kibanaSavedObjectMeta": {
             "searchSourceJSON": "{\"index\":\"logs-threats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
         }
@@ -317,17 +351,17 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
 ENDJSON
 create_object "visualization" "viz-l3-attack-types" "${TMPDIR}/body.json"
 
-# Viz: L3 Threat Detail Table (saved search)
-echo "Creating: Threat Detail Table (L3)"
+# Viz: L3 All Results Detail Table (saved search - shows everything L3 analyzed)
+echo "Creating: L3 All Results Detail Table"
 cat > "${TMPDIR}/body.json" <<'ENDJSON'
 {
     "attributes": {
-        "title": "Confirmed Threats Detail (L3)",
-        "description": "Layer 3 correlated and confirmed threats with attack narrative",
-        "columns": ["@timestamp", "hostname", "attack_type", "severity", "confidence_pct", "narrative", "evidence_summary", "immediate_actions"],
+        "title": "Layer 3 Correlation Results (All)",
+        "description": "All events analyzed by Layer 3 - confirmed threats and false positives",
+        "columns": ["@timestamp", "hostname", "confirmed", "attack_type", "severity", "confidence_pct", "narrative", "evidence_summary", "correlated_events_count", "immediate_actions"],
         "sort": [["@timestamp", "desc"]],
         "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"index\":\"logs-threats\",\"query\":{\"query\":\"confirmed:true\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"
+            "searchSourceJSON": "{\"index\":\"logs-threats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"
         }
     }
 }
@@ -341,19 +375,19 @@ echo ""
 echo "--- Creating dashboard ---"
 
 # Panel layout (48 column grid):
-# Row 0 (y=0,  h=8):  L3 Confirmed Threats(12w) | L3 Attack Types(16w) | L2 Threat Cat(10w) | LLM Severity(10w)
-# Row 1 (y=8,  h=14): L3 Threat Detail Table (48w)
-# Row 2 (y=22, h=12): L2 Threat Cat(16w) | L2 Severity(16w) | Pending(8w) | Queue(8w)
-# Row 3 (y=34, h=14): L2 LLM Detail Table (48w)
-# Row 4 (y=48, h=12): Events Over Time(20w) | Score Distribution(14w) | Top Hosts(14w)
-# Row 5 (y=60, h=10): Suspicious Patterns(16w) | Throughput(16w) | Anomaly Rate(16w)
+# Row 0 (y=0,  h=8):  L3 Total(8w) | L3 Confirmed(8w) | Confirmed vs Not(16w) | Attack Types(16w)
+# Row 1 (y=8,  h=14): L3 All Results Detail Table (48w) - shows confirmed + not confirmed
+# Row 2 (y=22, h=8):  L2 Threat Cat(12w) | L2 Severity(12w) | Pending(12w) | Queue(12w)
+# Row 3 (y=30, h=14): L2 LLM Detail Table (48w)
+# Row 4 (y=44, h=12): Events Over Time(20w) | Score Distribution(14w) | Top Hosts(14w)
+# Row 5 (y=56, h=10): Suspicious Patterns(16w) | Throughput(16w) | Anomaly Rate(16w)
 
 cat > "${TMPDIR}/body.json" <<'ENDJSON'
 {
     "attributes": {
         "title": "AI Log Filter - PoC Dashboard",
-        "description": "AI-powered syslog anomaly detection - Layer 3 confirmed threats on top, Layer 2 LLM analysis, Layer 1 ML below",
-        "panelsJSON": "[{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":0,\"w\":12,\"h\":8,\"i\":\"L3a\"},\"id\":\"viz-confirmed-threats\",\"panelIndex\":\"L3a\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":12,\"y\":0,\"w\":16,\"h\":8,\"i\":\"L3b\"},\"id\":\"viz-l3-attack-types\",\"panelIndex\":\"L3b\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":28,\"y\":0,\"w\":10,\"h\":8,\"i\":\"L2a\"},\"id\":\"viz-threat-categories\",\"panelIndex\":\"L2a\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":38,\"y\":0,\"w\":10,\"h\":8,\"i\":\"L2b\"},\"id\":\"viz-llm-severity\",\"panelIndex\":\"L2b\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":8,\"w\":48,\"h\":14,\"i\":\"L3c\"},\"id\":\"search-l3-threats\",\"panelIndex\":\"L3c\",\"type\":\"search\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":22,\"w\":16,\"h\":8,\"i\":\"3\"},\"id\":\"viz-pending-llm\",\"panelIndex\":\"3\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":16,\"y\":22,\"w\":16,\"h\":8,\"i\":\"4\"},\"id\":\"viz-llm-queue-depth\",\"panelIndex\":\"4\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":32,\"y\":22,\"w\":16,\"h\":8,\"i\":\"4b\"},\"id\":\"viz-top-anomalous-hosts\",\"panelIndex\":\"4b\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":30,\"w\":48,\"h\":14,\"i\":\"5\"},\"id\":\"search-latest-anomalies\",\"panelIndex\":\"5\",\"type\":\"search\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":44,\"w\":20,\"h\":12,\"i\":\"6\"},\"id\":\"viz-events-over-time\",\"panelIndex\":\"6\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":20,\"y\":44,\"w\":14,\"h\":12,\"i\":\"7\"},\"id\":\"viz-anomaly-score-dist\",\"panelIndex\":\"7\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":34,\"y\":44,\"w\":14,\"h\":12,\"i\":\"8\"},\"id\":\"viz-suspicious-patterns\",\"panelIndex\":\"8\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":56,\"w\":24,\"h\":10,\"i\":\"10\"},\"id\":\"viz-processing-stats\",\"panelIndex\":\"10\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":24,\"y\":56,\"w\":24,\"h\":10,\"i\":\"11\"},\"id\":\"viz-anomaly-rate\",\"panelIndex\":\"11\",\"type\":\"visualization\",\"version\":\"2.18.0\"}]",
+        "description": "AI-powered syslog anomaly detection - Layer 3 correlation on top, Layer 2 LLM analysis, Layer 1 ML below",
+        "panelsJSON": "[{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":0,\"w\":8,\"h\":8,\"i\":\"L3t\"},\"id\":\"viz-l3-total-analyzed\",\"panelIndex\":\"L3t\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":8,\"y\":0,\"w\":8,\"h\":8,\"i\":\"L3a\"},\"id\":\"viz-confirmed-threats\",\"panelIndex\":\"L3a\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":16,\"y\":0,\"w\":16,\"h\":8,\"i\":\"L3d\"},\"id\":\"viz-l3-confirmed-vs-not\",\"panelIndex\":\"L3d\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":32,\"y\":0,\"w\":16,\"h\":8,\"i\":\"L3b\"},\"id\":\"viz-l3-attack-types\",\"panelIndex\":\"L3b\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":8,\"w\":48,\"h\":14,\"i\":\"L3c\"},\"id\":\"search-l3-threats\",\"panelIndex\":\"L3c\",\"type\":\"search\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":22,\"w\":12,\"h\":8,\"i\":\"L2a\"},\"id\":\"viz-threat-categories\",\"panelIndex\":\"L2a\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":12,\"y\":22,\"w\":12,\"h\":8,\"i\":\"L2b\"},\"id\":\"viz-llm-severity\",\"panelIndex\":\"L2b\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":24,\"y\":22,\"w\":12,\"h\":8,\"i\":\"3\"},\"id\":\"viz-pending-llm\",\"panelIndex\":\"3\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":36,\"y\":22,\"w\":12,\"h\":8,\"i\":\"4\"},\"id\":\"viz-llm-queue-depth\",\"panelIndex\":\"4\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":30,\"w\":48,\"h\":14,\"i\":\"5\"},\"id\":\"search-latest-anomalies\",\"panelIndex\":\"5\",\"type\":\"search\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":44,\"w\":20,\"h\":12,\"i\":\"6\"},\"id\":\"viz-events-over-time\",\"panelIndex\":\"6\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":20,\"y\":44,\"w\":14,\"h\":12,\"i\":\"7\"},\"id\":\"viz-anomaly-score-dist\",\"panelIndex\":\"7\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":34,\"y\":44,\"w\":14,\"h\":12,\"i\":\"4b\"},\"id\":\"viz-top-anomalous-hosts\",\"panelIndex\":\"4b\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":0,\"y\":56,\"w\":16,\"h\":10,\"i\":\"8\"},\"id\":\"viz-suspicious-patterns\",\"panelIndex\":\"8\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":16,\"y\":56,\"w\":16,\"h\":10,\"i\":\"10\"},\"id\":\"viz-processing-stats\",\"panelIndex\":\"10\",\"type\":\"visualization\",\"version\":\"2.18.0\"},{\"embeddableConfig\":{},\"gridData\":{\"x\":32,\"y\":56,\"w\":16,\"h\":10,\"i\":\"11\"},\"id\":\"viz-anomaly-rate\",\"panelIndex\":\"11\",\"type\":\"visualization\",\"version\":\"2.18.0\"}]",
         "optionsJSON": "{\"hidePanelTitles\":false,\"useMargins\":true}",
         "timeRestore": true,
         "timeTo": "now",
@@ -367,17 +401,19 @@ cat > "${TMPDIR}/body.json" <<'ENDJSON'
         }
     },
     "references": [
+        {"id": "viz-l3-total-analyzed", "name": "panel_L3t", "type": "visualization"},
         {"id": "viz-confirmed-threats", "name": "panel_L3a", "type": "visualization"},
+        {"id": "viz-l3-confirmed-vs-not", "name": "panel_L3d", "type": "visualization"},
         {"id": "viz-l3-attack-types", "name": "panel_L3b", "type": "visualization"},
+        {"id": "search-l3-threats", "name": "panel_L3c", "type": "search"},
         {"id": "viz-threat-categories", "name": "panel_L2a", "type": "visualization"},
         {"id": "viz-llm-severity", "name": "panel_L2b", "type": "visualization"},
-        {"id": "search-l3-threats", "name": "panel_L3c", "type": "search"},
         {"id": "viz-pending-llm", "name": "panel_3", "type": "visualization"},
         {"id": "viz-llm-queue-depth", "name": "panel_4", "type": "visualization"},
-        {"id": "viz-top-anomalous-hosts", "name": "panel_4b", "type": "visualization"},
         {"id": "search-latest-anomalies", "name": "panel_5", "type": "search"},
         {"id": "viz-events-over-time", "name": "panel_6", "type": "visualization"},
         {"id": "viz-anomaly-score-dist", "name": "panel_7", "type": "visualization"},
+        {"id": "viz-top-anomalous-hosts", "name": "panel_4b", "type": "visualization"},
         {"id": "viz-suspicious-patterns", "name": "panel_8", "type": "visualization"},
         {"id": "viz-processing-stats", "name": "panel_10", "type": "visualization"},
         {"id": "viz-anomaly-rate", "name": "panel_11", "type": "visualization"}
@@ -392,9 +428,9 @@ echo ""
 echo "Open your browser: ${DASHBOARDS_URL}/app/dashboards#/view/dashboard-ai-log-filter"
 echo ""
 echo "Dashboard layout:"
-echo "  ROW 1:  L3 Confirmed Threats | L3 Attack Types | L2 Threat Cat | L2 Severity"
-echo "  ROW 2:  L3 Confirmed Threats Detail Table"
-echo "  ROW 3:  Pending LLM | LLM Queue Depth | Top Anomalous Hosts"
+echo "  ROW 1:  L3 Total Analyzed | L3 Confirmed | Confirmed vs Not | Attack Types"
+echo "  ROW 2:  L3 All Results Table (confirmed + not confirmed, with 'confirmed' column)"
+echo "  ROW 3:  L2 Threat Categories | L2 Severity | Pending LLM | LLM Queue Depth"
 echo "  ROW 4:  L2 LLM Analysis Detail Table"
-echo "  ROW 5:  Events Over Time | Score Distribution | Suspicious Patterns"
-echo "  ROW 6:  Processing Throughput | Anomaly Rate"
+echo "  ROW 5:  Events Over Time | Score Distribution | Top Anomalous Hosts"
+echo "  ROW 6:  Suspicious Patterns | Throughput | Anomaly Rate"
