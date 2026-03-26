@@ -52,23 +52,56 @@ echo "[2/5] Configuring Ollama to listen on 0.0.0.0:11434..."
 # Create systemd override to set OLLAMA_HOST
 mkdir -p /etc/systemd/system/ollama.service.d
 
-cat > /etc/systemd/system/ollama.service.d/override.conf <<'EOF'
+PHYSICAL_CORES=$(lscpu -p=core | grep -v '^#' | sort -u | wc -l)
+NUMA_NODES=$(lscpu | grep "NUMA node(s)" | awk '{print $NF}')
+echo "  -> Detected ${PHYSICAL_CORES} physical cores, ${NUMA_NODES} NUMA node(s)"
+
+# Calculate optimal parallel requests
+# Rule: 4 parallel requests for <=32 cores, 8 for >32 cores
+if [ "${PHYSICAL_CORES}" -gt 32 ]; then
+    NUM_PARALLEL=8
+else
+    NUM_PARALLEL=4
+fi
+
+cat > /etc/systemd/system/ollama.service.d/override.conf <<EOF
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-# Increase number of parallel requests (default is 1)
-Environment="OLLAMA_NUM_PARALLEL=4"
+# Parallel requests: ${NUM_PARALLEL} (based on ${PHYSICAL_CORES} physical cores)
+# Each request gets ~${PHYSICAL_CORES}/${NUM_PARALLEL} threads automatically.
+# Do NOT set OLLAMA_NUM_THREADS - let Ollama auto-detect for best throughput.
+Environment="OLLAMA_NUM_PARALLEL=${NUM_PARALLEL}"
 # Keep model loaded in memory (don't unload between requests)
 Environment="OLLAMA_KEEP_ALIVE=-1"
 EOF
 
+# NUMA optimization for multi-socket servers (2+ NUMA nodes)
+if [ "${NUMA_NODES}" -gt 1 ]; then
+    echo "  -> Multi-socket server detected (${NUMA_NODES} NUMA nodes)."
+    echo "  -> Adding NUMA pinning to node 0 for optimal memory bandwidth."
+    # Pin Ollama to NUMA node 0 to avoid cross-socket memory access
+    # which can cut LLM inference speed by 30-50%.
+    cat >> /etc/systemd/system/ollama.service.d/override.conf <<'EOF2'
+# NUMA pinning: restrict to node 0 to avoid cross-socket memory latency.
+# If you want to use all sockets, remove this line but expect ~30% slower
+# per-request inference due to remote memory access.
+ExecStart=
+ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 /usr/local/bin/ollama serve
+EOF2
+    # Check if numactl is installed
+    if ! command -v numactl &>/dev/null; then
+        echo "  -> WARNING: numactl not installed. Install with: yum install numactl / apt install numactl"
+    fi
+fi
+
 # If proxy is needed, add it to the override
 if [ -n "${HTTP_PROXY:-}" ] || [ -n "${HTTPS_PROXY:-}" ]; then
     echo "  -> Adding proxy configuration..."
-    cat >> /etc/systemd/system/ollama.service.d/override.conf <<EOF
+    cat >> /etc/systemd/system/ollama.service.d/override.conf <<EOF3
 Environment="HTTP_PROXY=${HTTP_PROXY:-}"
 Environment="HTTPS_PROXY=${HTTPS_PROXY:-}"
 Environment="NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}"
-EOF
+EOF3
 fi
 
 systemctl daemon-reload
