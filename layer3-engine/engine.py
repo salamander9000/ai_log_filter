@@ -522,39 +522,69 @@ def main():
             llm_result = query_llm(prompt)
             latency_ms = (time.time() - t0) * 1000
 
-            if not llm_result:
-                log.warning("Layer 3 LLM returned no result for doc %s", doc_id[:12])
-                continue
+            # --- Step 4: Index to logs-threats (even if LLM failed) ---
+            if llm_result:
+                is_confirmed = llm_result.get("confirmed", False)
+                # Coerce confidence_pct to int (LLM might return string or float)
+                try:
+                    confidence = int(llm_result.get("confidence_pct", 0))
+                except (ValueError, TypeError):
+                    confidence = 0
+                threat_doc = {
+                    "@timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "original_anomaly_id": doc_id,
+                    "original_log_line": anomaly.get("original_log_line", anomaly.get("raw", "")),
+                    "hostname": hostname,
+                    "process": anomaly.get("process", ""),
+                    "source_ips": corr["unique_ips"],
+                    "l2_threat_category": l2_category,
+                    "l2_severity": l2_severity,
+                    "l2_explanation": anomaly.get("llm_explanation", ""),
+                    "anomaly_score": anomaly.get("anomaly_score", 0),
+                    "confirmed": is_confirmed,
+                    "attack_type": llm_result.get("attack_type", "unknown"),
+                    "narrative": llm_result.get("narrative", ""),
+                    "immediate_actions": json.dumps(llm_result.get("immediate_actions", [])),
+                    "confidence_pct": confidence,
+                    "severity": llm_result.get("severity", "unknown"),
+                    "evidence_summary": llm_result.get("evidence_summary", ""),
+                    "correlated_events_count": len(corr["events"]),
+                    "failed_auth_count": corr["failed_auth_count"],
+                    "success_auth_count": corr["success_auth_count"],
+                    "correlation_window_sec": CORRELATION_WINDOW_SEC,
+                    "l3_raw_response": json.dumps(llm_result),
+                }
+            else:
+                # LLM failed - still index so we have visibility in the dashboard
+                is_confirmed = False
+                log.warning("Layer 3 LLM returned no result for doc %s - indexing as llm_failed", doc_id[:12])
+                threat_doc = {
+                    "@timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "original_anomaly_id": doc_id,
+                    "original_log_line": anomaly.get("original_log_line", anomaly.get("raw", "")),
+                    "hostname": hostname,
+                    "process": anomaly.get("process", ""),
+                    "source_ips": corr["unique_ips"],
+                    "l2_threat_category": l2_category,
+                    "l2_severity": l2_severity,
+                    "l2_explanation": anomaly.get("llm_explanation", ""),
+                    "anomaly_score": anomaly.get("anomaly_score", 0),
+                    "confirmed": False,
+                    "attack_type": "llm_failed",
+                    "narrative": "Layer 3 LLM analysis failed - event needs manual review",
+                    "immediate_actions": "[]",
+                    "confidence_pct": 0,
+                    "severity": l2_severity,
+                    "evidence_summary": f"L2 flagged as {l2_category}/{l2_severity}. L3 LLM could not analyze. Correlated events: {len(corr['events'])}",
+                    "correlated_events_count": len(corr["events"]),
+                    "failed_auth_count": corr["failed_auth_count"],
+                    "success_auth_count": corr["success_auth_count"],
+                    "correlation_window_sec": CORRELATION_WINDOW_SEC,
+                    "l3_raw_response": "",
+                }
 
-            is_confirmed = llm_result.get("confirmed", False)
             if is_confirmed:
                 total_confirmed += 1
-
-            # --- Step 4: Index to logs-threats ---
-            threat_doc = {
-                "@timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                "original_anomaly_id": doc_id,
-                "original_log_line": anomaly.get("original_log_line", anomaly.get("raw", "")),
-                "hostname": hostname,
-                "process": anomaly.get("process", ""),
-                "source_ips": corr["unique_ips"],
-                "l2_threat_category": l2_category,
-                "l2_severity": l2_severity,
-                "l2_explanation": anomaly.get("llm_explanation", ""),
-                "anomaly_score": anomaly.get("anomaly_score", 0),
-                "confirmed": is_confirmed,
-                "attack_type": llm_result.get("attack_type", "unknown"),
-                "narrative": llm_result.get("narrative", ""),
-                "immediate_actions": json.dumps(llm_result.get("immediate_actions", [])),
-                "confidence_pct": llm_result.get("confidence_pct", 0),
-                "severity": llm_result.get("severity", "unknown"),
-                "evidence_summary": llm_result.get("evidence_summary", ""),
-                "correlated_events_count": len(corr["events"]),
-                "failed_auth_count": corr["failed_auth_count"],
-                "success_auth_count": corr["success_auth_count"],
-                "correlation_window_sec": CORRELATION_WINDOW_SEC,
-                "l3_raw_response": json.dumps(llm_result),
-            }
 
             try:
                 os_client.index(index=IDX_THREATS, body=threat_doc)

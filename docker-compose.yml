@@ -58,10 +58,12 @@ services:
   # Port 11435 -> Layer 3 pool (larger model)
   # Stats: http://localhost:8405/stats
   haproxy:
-    image: haproxy:2.9-alpine
+    build:
+      context: ./haproxy
+      dockerfile: Dockerfile
     container_name: haproxy
-    volumes:
-      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    # Config is COPY'd during build (no permission issues).
+    # To update: edit haproxy/haproxy.cfg, then docker compose up -d --build
     ports:
       - "8405:8405"      # HAProxy stats page
     networks:
