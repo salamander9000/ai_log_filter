@@ -54,6 +54,8 @@ services:
       retries: 10
 
   # --- HAProxy: load balancer for Ollama server pool ---
+  # Optional: only needed when using multiple Ollama servers.
+  # For single-server, set OLLAMA_HOST directly in .env and skip HAProxy.
   haproxy:
     image: haproxy:2.9-alpine
     container_name: haproxy
@@ -61,29 +63,12 @@ services:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "8405:8405"      # HAProxy stats page
-      # Note: port 11434 is internal only (not exposed to host)
-      # The AI service and Layer 3 connect to haproxy:11434 inside Docker
     networks:
       - lognet
-    depends_on:
-      - ollama
-
-  # --- Ollama local instance (CPU only, single-server / fallback) ---
-  # For multi-server: add bare metal servers to haproxy/haproxy.cfg
-  # and optionally disable this local instance if not needed.
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama-models:/root/.ollama
-    environment:
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - NO_PROXY=${NO_PROXY:-}
-    networks:
-      - lognet
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    profiles:
+      - multi-ollama    # only starts with: docker compose --profile multi-ollama up
 
   # --- Syslog TCP/UDP receiver (accepts remote syslog, pushes to Redis) ---
   syslog-receiver:
@@ -138,7 +123,11 @@ services:
     container_name: ai-log-service
     environment:
       - OPENSEARCH_HOST=http://opensearch:9200
-      - OLLAMA_HOST=http://haproxy:11434
+      # OLLAMA_HOST: point to your Ollama instance(s)
+      #   Single server:  http://host.docker.internal:11434  (Ollama on the host)
+      #   Multi-server:   http://haproxy:11434               (via HAProxy load balancer)
+      #   Remote server:  http://10.0.1.10:11434             (direct to a specific server)
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
       - REDIS_HOST=redis://redis:6379
       - REDIS_KEY=filebeat:logs
       - INPUT_MODE=${INPUT_MODE:-redis}
@@ -156,6 +145,8 @@ services:
       - L3_ENABLED=${L3_ENABLED:-true}
       - L3_QUEUE_KEY=layer3:queue
       - L3_SEVERITY_FILTER=high,critical
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - shared-logs:/var/log/synthetic:ro
     networks:
@@ -165,8 +156,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      haproxy:
-        condition: service_started
 
   # --- Layer 3: Correlation Engine ---
   # Consumes high-severity anomalies, queries production ES for context,
@@ -184,7 +173,8 @@ services:
       - REDIS_HOST=redis://redis:6379
       - L3_QUEUE_KEY=layer3:queue
       - OPENSEARCH_HOST=http://opensearch:9200
-      - OLLAMA_HOST=http://haproxy:11434
+      # L3 can use same Ollama as L2, or a different/larger model on different servers
+      - OLLAMA_HOST=${L3_OLLAMA_HOST:-${OLLAMA_HOST:-http://host.docker.internal:11434}}
       # Layer 3 LLM model (can be different/larger than Layer 2)
       - L3_LLM_MODEL=${L3_LLM_MODEL:-qwen2.5:3b}
       # Production Elasticsearch for contextual queries
@@ -197,6 +187,8 @@ services:
       - CORRELATION_WINDOW_SEC=${CORRELATION_WINDOW_SEC:-300}
       - MAX_CORRELATED_EVENTS=100
       - L3_SEVERITY_FILTER=high,critical
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - lognet
     depends_on:
@@ -204,12 +196,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      haproxy:
-        condition: service_started
 
 volumes:
   opensearch-data:
-  ollama-models:
   shared-logs:
 
 networks:
