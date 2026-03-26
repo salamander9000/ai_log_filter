@@ -258,6 +258,8 @@ def query_correlated_events(es_client: Elasticsearch, anomaly: dict,
     }
 
     if es_client is None:
+        result["unique_ips"] = list(result["unique_ips"])
+        result["unique_hosts"] = list(result["unique_hosts"])
         return result
 
     # Extract context from the anomaly
@@ -285,6 +287,8 @@ def query_correlated_events(es_client: Elasticsearch, anomaly: dict,
 
     if not should_clauses:
         log.warning("No correlation criteria found for anomaly.")
+        result["unique_ips"] = list(result["unique_ips"])
+        result["unique_hosts"] = list(result["unique_hosts"])
         return result
 
     query = {
