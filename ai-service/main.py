@@ -41,7 +41,7 @@ import redis as redispy
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "http://localhost:9200")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/syslog")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:0.5b")
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
 ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.4"))
 TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "5000"))
