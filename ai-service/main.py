@@ -20,7 +20,6 @@ import time
 import uuid
 import signal
 import logging
-import hashlib
 import datetime
 from collections import defaultdict, deque
 from threading import Thread, Event
@@ -43,10 +42,15 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LOG_FILE = os.getenv("LOG_FILE", "/var/log/syslog")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:0.5b")
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() == "true"
-ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.4"))
+ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "-0.6"))
 TRAINING_WINDOW = int(os.getenv("TRAINING_WINDOW", "5000"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-CONTAMINATION = float(os.getenv("CONTAMINATION", "0.01"))
+# contamination: "auto" lets sklearn determine the threshold from the data,
+# or a float like "0.01" forces exactly that percentage to be flagged.
+_contam_raw = os.getenv("CONTAMINATION", "auto")
+CONTAMINATION = _contam_raw if _contam_raw == "auto" else float(_contam_raw)
+# Allowlist: templates seen in more than this % of training data are skipped
+ALLOWLIST_MIN_PCT = float(os.getenv("ALLOWLIST_MIN_PCT", "1.0"))
 
 # Input mode: "redis" or "file"
 INPUT_MODE = os.getenv("INPUT_MODE", "redis")
@@ -202,23 +206,53 @@ class FeatureExtractor:
     All features are bounded (0-1 or small fixed range) so the model
     behaves consistently regardless of how long the service has been running.
 
-    Features per event:
+    Features per event (7 features):
     1. message_length        - length of log message (chars)
     2. severity_level        - numeric severity (0=emerg .. 7=debug)
     3. suspicious_score      - max score from regex pattern matching (0-1)
-    4. template_id_hash      - hash of the Drain3 template (0-9999)
-    5. template_rarity       - 1/count, capped at 1.0 (rare=high, common=low)
-    6. hour_of_day           - 0-23
-    7. process_ratio          - process count / total events (0-1)
-    8. msg_word_count         - number of words in the message
+    4. template_rarity       - 1/count, capped at 1.0 (rare=high, common=low)
+    5. hour_of_day           - 0-23
+    6. process_ratio          - process count / total events (0-1)
+    7. msg_word_count         - number of words in the message
     """
 
-    def __init__(self, template_miner: TemplateMiner):
+    def __init__(self, template_miner: TemplateMiner, allowlist_min_pct: float = 1.0):
         self.miner = template_miner
         self.template_counts = defaultdict(int)
         self.process_counts = defaultdict(int)
         self.seen_templates = set()
         self.total_events = 0
+        self.allowlist_min_pct = allowlist_min_pct
+        self.allowlisted_templates: set = set()  # populated after training
+
+    def compute_allowlist(self):
+        """
+        Build allowlist of high-frequency templates that should be skipped.
+        Call this after the training window fills up.
+        Templates appearing in more than allowlist_min_pct% of events are
+        considered normal noise and will bypass Isolation Forest scoring.
+        """
+        if self.total_events == 0:
+            return
+        threshold_count = self.total_events * (self.allowlist_min_pct / 100.0)
+        self.allowlisted_templates = {
+            tid for tid, count in self.template_counts.items()
+            if count >= threshold_count
+        }
+        total_allowlisted_events = sum(
+            count for tid, count in self.template_counts.items()
+            if tid in self.allowlisted_templates
+        )
+        pct = (total_allowlisted_events / self.total_events * 100) if self.total_events > 0 else 0
+        log.info(
+            "Template allowlist: %d templates (%.1f%% of events) will bypass scoring. "
+            "Total unique templates: %d",
+            len(self.allowlisted_templates), pct, len(self.template_counts),
+        )
+
+    def is_allowlisted(self, template_id: int) -> bool:
+        """Check if a template is in the allowlist (high-frequency = normal noise)."""
+        return template_id in self.allowlisted_templates
 
     def extract(self, parsed: dict) -> tuple[np.ndarray, dict]:
         """Return (feature_vector, metadata_dict) for one parsed log event."""
@@ -255,17 +289,13 @@ class FeatureExtractor:
         # Hour of day (parse from timestamp or use current)
         hour = _parse_hour(parsed.get("timestamp_str", ""))
 
-        # Numeric template_id hash (make it a bounded int)
-        tid_hash = int(hashlib.md5(str(template_id).encode()).hexdigest()[:8], 16) % 10000
-
-        # Word count (structural dimension - anomalous messages often have unusual word counts)
+        # Word count
         msg_word_count = len(msg.split())
 
         features = np.array([
             len(msg),                     # message_length
             severity_level,               # severity_level
             max_suspicious_score,         # suspicious_score
-            tid_hash,                     # template_id_hash
             template_rarity,              # template_rarity (1/count, bounded 0-1)
             hour,                         # hour_of_day
             process_ratio,                # process_ratio (count/total, bounded 0-1)
@@ -301,13 +331,14 @@ def _parse_hour(ts_str: str) -> int:
 # Anomaly detector (Isolation Forest with online retraining)
 # ---------------------------------------------------------------------------
 class AnomalyDetector:
-    """Wraps Isolation Forest with periodic retraining."""
+    """Wraps Isolation Forest with periodic retraining and template allowlisting."""
 
-    def __init__(self, training_window: int = 500, threshold: float = -0.3,
-                 contamination: float = 0.02):
+    def __init__(self, training_window: int = 500, threshold: float = -0.6,
+                 contamination="auto", feature_extractor: FeatureExtractor | None = None):
         self.training_window = training_window
         self.threshold = threshold
         self.contamination = contamination
+        self.feature_extractor = feature_extractor
         self.buffer = deque(maxlen=training_window * 2)
         self.model: IsolationForest | None = None
         self.scaler = StandardScaler()
@@ -359,6 +390,10 @@ class AnomalyDetector:
             "Isolation Forest retrained on %d samples (buffer size: %d)",
             len(X), len(self.buffer),
         )
+
+        # Rebuild template allowlist after each training
+        if self.feature_extractor is not None:
+            self.feature_extractor.compute_allowlist()
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +995,7 @@ def main():
     log.info("Config: ANOMALY_THRESHOLD=%s", ANOMALY_THRESHOLD)
     log.info("Config: TRAINING_WINDOW=%s", TRAINING_WINDOW)
     log.info("Config: CONTAMINATION=%s", CONTAMINATION)
+    log.info("Config: ALLOWLIST_MIN_PCT=%s%%", ALLOWLIST_MIN_PCT)
 
     # --- Initialize components ---
     os_client = create_opensearch_client()
@@ -977,11 +1013,12 @@ def main():
 
     # ML components
     template_miner = create_template_miner()
-    feature_extractor = FeatureExtractor(template_miner)
+    feature_extractor = FeatureExtractor(template_miner, allowlist_min_pct=ALLOWLIST_MIN_PCT)
     anomaly_detector = AnomalyDetector(
         training_window=TRAINING_WINDOW,
         threshold=ANOMALY_THRESHOLD,
         contamination=CONTAMINATION,
+        feature_extractor=feature_extractor,
     )
     stats = StatsTracker(os_client)
 
@@ -1026,8 +1063,12 @@ def main():
         # Extract features
         features, metadata = feature_extractor.extract(parsed)
 
-        # Anomaly detection (Layer 1 - microseconds)
-        score, is_anomaly = anomaly_detector.add_and_score(features)
+        # Allowlist check: skip scoring for high-frequency templates (known noise)
+        if feature_extractor.is_allowlisted(metadata["template_id"]):
+            score, is_anomaly = 0.0, False
+        else:
+            # Anomaly detection (Layer 1 - microseconds)
+            score, is_anomaly = anomaly_detector.add_and_score(features)
 
         # Build the base document
         now_iso = datetime.datetime.utcnow().isoformat() + "Z"

@@ -133,9 +133,10 @@ services:
       # LLM_WORKERS: L2 pool capacity (4+4+2) + 2 headroom = 12
       - LLM_WORKERS=${LLM_WORKERS:-12}
       - LLM_QUEUE_SIZE=10000
-      - "ANOMALY_THRESHOLD=-0.4"
+      - "ANOMALY_THRESHOLD=-0.6"
       - TRAINING_WINDOW=5000
-      - CONTAMINATION=0.01
+      - CONTAMINATION=auto
+      - ALLOWLIST_MIN_PCT=1.0
       - BATCH_SIZE=50
       # Layer 3 integration: push high-severity anomalies to Layer 3 queue
       - L3_ENABLED=${L3_ENABLED:-true}
