@@ -52,8 +52,9 @@ PROD_ES_VERIFY_CERTS = os.getenv("PROD_ES_VERIFY_CERTS", "false").lower() == "tr
 # PoC OpenSearch (for writing results and fallback queries)
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "http://opensearch:9200")
 
-# Correlation settings
-CORRELATION_WINDOW_SEC = int(os.getenv("CORRELATION_WINDOW_SEC", "300"))
+# Correlation settings - asymmetric window around the anomaly timestamp
+CORRELATION_BEFORE_SEC = int(os.getenv("CORRELATION_BEFORE_SEC", "20"))
+CORRELATION_AFTER_SEC = int(os.getenv("CORRELATION_AFTER_SEC", "30"))
 MAX_CORRELATED_EVENTS = int(os.getenv("MAX_CORRELATED_EVENTS", "100"))
 # Delay before L3 analysis (seconds) - gives time for follow-up events
 # (e.g., successful login after brute force) to be indexed
@@ -91,46 +92,71 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # ---------------------------------------------------------------------------
 L3_PROMPT_TEMPLATE = """You are a senior security analyst performing threat correlation.
 You have access to the original anomaly alert and correlated events from the
-environment's log history.
+environment's log history. All correlated events are scoped to the SAME
+source IP and username - they belong to the same actor.
 
 ORIGINAL ALERT (from automated Layer 2 analysis):
 - Log entry: {log_line}
 - Host: {hostname}
 - Process: {process}
+- Source IP: {source_ip}
+- Target username: {username}
 - Layer 2 threat category: {l2_threat_category}
 - Layer 2 severity: {l2_severity}
 - Layer 2 explanation: {l2_explanation}
 - Anomaly score: {anomaly_score}
 
-CORRELATED EVENTS (last {window_sec} seconds, same source/host):
+CORRELATED EVENTS (scoped to same IP/user, {before_sec}s before to {after_sec}s after):
 {correlated_events}
 
 TIMELINE SUMMARY:
-- Total correlated events found: {correlated_count}
-- Failed auth attempts: {failed_auth_count}
-- Successful auth attempts: {success_auth_count}
-- Unique source IPs: {unique_ips}
-- Unique target hosts: {unique_hosts}
+- Total correlated events from this IP/user: {correlated_count}
+- Failed auth attempts from this IP/user: {failed_auth_count}
+- Successful auth from this IP/user: {success_auth_count}
+
+CRITICAL: If there are failed auth attempts followed by a successful login
+from the SAME source IP, this is a confirmed breach (brute_force_success).
+The severity should be CRITICAL.
 
 Based on the correlated events, provide a final threat assessment.
 Consider multi-step attack patterns:
-- Brute force: many failed logins from same IP, especially if followed by success
+- Brute force with breach: failed logins + successful login = CRITICAL (confirmed compromise)
+- Brute force attempt: multiple failed logins, no success = high (attempt only)
 - Privilege escalation: sudo/su failures followed by success
-- Lateral movement: authentication from unusual internal IPs after initial compromise
 - Service disruption: repeated crashes or restarts of the same service
 
 Respond in this exact JSON format (no markdown, no extra text):
 {{"confirmed": true, "attack_type": "<specific type e.g. brute_force_success, brute_force_attempt, privilege_escalation_confirmed, service_disruption, false_positive>", "narrative": "<2-3 sentence attack narrative based on the evidence>", "immediate_actions": ["<action 1>", "<action 2>"], "confidence_pct": 85, "severity": "<critical/high/medium/low>", "evidence_summary": "<1-2 sentence summary of key evidence>"}}"""
 
 # ---------------------------------------------------------------------------
-# IP extraction regex
+# Extraction regexes for scoping correlation queries
 # ---------------------------------------------------------------------------
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+# Matches: "for root from", "for invalid user admin from", "for user alice"
+USERNAME_RE = re.compile(
+    r"(?:for (?:invalid user )?(\w+) from)"
+    r"|(?:session (?:opened|closed) for user (\w+))"
+    r"|(?:Accepted (?:password|publickey) for (\w+) from)"
+    r"|(?:FAILED SU \(to (\w+)\))"
+    r"|(?:USER=(\w+))"
+)
 
 
 def extract_ips(text: str) -> list[str]:
     """Extract all IP addresses from text."""
     return list(set(IP_RE.findall(text)))
+
+
+def extract_username(text: str) -> str | None:
+    """Extract the target username from a syslog auth message."""
+    m = USERNAME_RE.search(text)
+    if m:
+        # Return the first non-None group
+        for group in m.groups():
+            if group:
+                return group
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -285,16 +311,13 @@ def _run_correlation_query(client, index: str, query: dict, result: dict,
 
 
 def query_correlated_events(es_client: Elasticsearch, os_client: OpenSearch,
-                            anomaly: dict, window_sec: int, max_events: int) -> dict:
+                            anomaly: dict, max_events: int) -> dict:
     """
-    Query for events correlated to the anomaly using a BIDIRECTIONAL time
-    window (before AND after the anomaly timestamp).
+    Query for events correlated to the anomaly, SCOPED to the same source IP
+    and username. Uses an asymmetric time window (BEFORE + AFTER the anomaly).
 
-    Queries production ES if configured, otherwise falls back to the local
+    Queries production ES if configured, otherwise falls back to local
     PoC OpenSearch (logs-processed index).
-
-    Specifically looks for successful logins after failed auth attempts
-    to detect brute force with successful breach.
 
     Returns a dict with:
       - events: list of correlated log lines (chronological)
@@ -302,6 +325,8 @@ def query_correlated_events(es_client: Elasticsearch, os_client: OpenSearch,
       - success_auth_count: number of successful auth events
       - unique_ips: list of unique source IPs
       - unique_hosts: list of unique hostnames
+      - source_ip: the source IP the correlation is scoped to
+      - username: the username the correlation is scoped to
     """
     result = {
         "events": [],
@@ -309,47 +334,57 @@ def query_correlated_events(es_client: Elasticsearch, os_client: OpenSearch,
         "success_auth_count": 0,
         "unique_ips": set(),
         "unique_hosts": set(),
+        "source_ip": None,
+        "username": None,
     }
 
-    # Extract context from the anomaly
+    # Extract context from the anomaly - SCOPED to specific IP + username
     hostname = anomaly.get("hostname", "")
     message = anomaly.get("message", anomaly.get("original_log_line", ""))
     source_ips = extract_ips(message)
+    username = extract_username(message)
 
-    # Build bidirectional time range anchored on the anomaly timestamp
-    # Look BEFORE and AFTER the event to catch follow-up actions (e.g., successful login after brute force)
+    result["source_ip"] = source_ips[0] if source_ips else None
+    result["username"] = username
+
+    log.info("Correlation scope: hostname=%s, source_ip=%s, username=%s",
+             hostname, result["source_ip"], username)
+
+    # Build asymmetric bidirectional time range anchored on the anomaly timestamp
     anomaly_ts = anomaly.get("@timestamp", "")
     if anomaly_ts:
         time_range = {"range": {"@timestamp": {
-            "gte": f"{anomaly_ts}||-{window_sec}s",
-            "lte": f"{anomaly_ts}||+{window_sec}s",
+            "gte": f"{anomaly_ts}||-{CORRELATION_BEFORE_SEC}s",
+            "lte": f"{anomaly_ts}||+{CORRELATION_AFTER_SEC}s",
         }}}
     else:
-        # Fallback: use now-based window if no timestamp available
-        time_range = {"range": {"@timestamp": {"gte": f"now-{window_sec}s"}}}
+        time_range = {"range": {"@timestamp": {
+            "gte": f"now-{CORRELATION_BEFORE_SEC}s",
+        }}}
 
-    # Build should clauses: match by source IP or by hostname
-    should_clauses = []
-    if source_ips:
-        for ip in source_ips:
-            should_clauses.append({"match_phrase": {"message": ip}})
+    # Build SCOPED query: must match SAME source IP (if found) on SAME host
+    must_clauses = [time_range]
+
+    # Always scope to the same hostname
     if hostname:
-        should_clauses.append({"term": {"hostname": hostname}})
+        must_clauses.append({"term": {"hostname": hostname}})
 
-    if not should_clauses:
-        log.warning("No correlation criteria found for anomaly.")
+    # Scope to the same source IP (critical for avoiding false correlations)
+    if source_ips:
+        must_clauses.append({"match_phrase": {"message": source_ips[0]}})
+
+    # Optionally scope to the same username
+    if username:
+        must_clauses.append({"match_phrase": {"message": username}})
+
+    if len(must_clauses) <= 1:
+        log.warning("No correlation criteria found (no hostname, IP, or username).")
         result["unique_ips"] = list(result["unique_ips"])
         result["unique_hosts"] = list(result["unique_hosts"])
         return result
 
     query = {
-        "query": {
-            "bool": {
-                "must": [time_range],
-                "should": should_clauses,
-                "minimum_should_match": 1,
-            }
-        },
+        "query": {"bool": {"must": must_clauses}},
         "sort": [{"@timestamp": {"order": "asc"}}],
         "size": max_events,
         "_source": ["@timestamp", "message", "hostname"],
@@ -359,40 +394,42 @@ def query_correlated_events(es_client: Elasticsearch, os_client: OpenSearch,
     if es_client is not None:
         _run_correlation_query(es_client, PROD_ES_INDEX, query, result, "prod-ES")
 
-    # Also/alternatively query local PoC OpenSearch (logs-processed)
-    # This catches events that went through our pipeline even without prod ES
+    # Fallback: query local PoC OpenSearch
     if os_client is not None and not result["events"]:
         _run_correlation_query(os_client, "logs-processed", query, result, "local-OS")
 
-    # If we found failed auth but no successful auth yet, do a targeted
-    # search specifically for successful logins (they might use different
-    # hostnames or not match the broad query)
+    # If we found failed auth but no success yet, do a targeted search
+    # for successful logins from the SAME source IP (breach detection)
     if result["failed_auth_count"] > 0 and result["success_auth_count"] == 0:
+        success_must = [time_range]
+        if hostname:
+            success_must.append({"term": {"hostname": hostname}})
+        # Must match same source IP for the success check
+        if source_ips:
+            success_must.append({"match_phrase": {"message": source_ips[0]}})
+        # Look for successful auth events
+        success_must.append({"bool": {"should": [
+            {"match_phrase": {"message": "Accepted password"}},
+            {"match_phrase": {"message": "Accepted publickey"}},
+        ], "minimum_should_match": 1}})
+
         success_query = {
-            "query": {
-                "bool": {
-                    "must": [
-                        time_range,
-                        {"bool": {"should": [
-                            {"match_phrase": {"message": "Accepted password"}},
-                            {"match_phrase": {"message": "Accepted publickey"}},
-                        ], "minimum_should_match": 1}},
-                    ],
-                    "should": should_clauses,
-                    "minimum_should_match": 1,
-                }
-            },
+            "query": {"bool": {"must": success_must}},
             "sort": [{"@timestamp": {"order": "asc"}}],
             "size": 20,
             "_source": ["@timestamp", "message", "hostname"],
         }
 
         if es_client is not None:
-            _run_correlation_query(es_client, PROD_ES_INDEX, success_query, result, "prod-ES-success-check")
+            _run_correlation_query(es_client, PROD_ES_INDEX, success_query, result, "prod-ES-breach-check")
         elif os_client is not None:
-            _run_correlation_query(os_client, "logs-processed", success_query, result, "local-OS-success-check")
+            _run_correlation_query(os_client, "logs-processed", success_query, result, "local-OS-breach-check")
 
-    # Sort all events chronologically and deduplicate
+        if result["success_auth_count"] > 0:
+            log.warning("BREACH DETECTED: successful login from %s after %d failed attempts!",
+                        source_ips[0] if source_ips else "unknown", result["failed_auth_count"])
+
+    # Sort chronologically and deduplicate
     result["events"] = sorted(set(result["events"]))
 
     # Convert sets to lists for JSON serialization
@@ -485,7 +522,7 @@ def main():
     log.info("Config: L3_LLM_MODEL=%s", L3_LLM_MODEL)
     log.info("Config: PROD_ES_HOST=%s", PROD_ES_HOST or "(not configured)")
     log.info("Config: PROD_ES_INDEX=%s", PROD_ES_INDEX)
-    log.info("Config: CORRELATION_WINDOW_SEC=%d", CORRELATION_WINDOW_SEC)
+    log.info("Config: CORRELATION_BEFORE_SEC=%d, AFTER_SEC=%d", CORRELATION_BEFORE_SEC, CORRELATION_AFTER_SEC)
     log.info("Config: L3_SEVERITY_FILTER=%s", L3_SEVERITY_FILTER)
 
     # --- Initialize ---
@@ -556,7 +593,7 @@ def main():
 
             # --- Step 1: Query for correlated events (bidirectional window) ---
             corr = query_correlated_events(
-                prod_es, os_client, anomaly, CORRELATION_WINDOW_SEC, MAX_CORRELATED_EVENTS,
+                prod_es, os_client, anomaly, MAX_CORRELATED_EVENTS,
             )
 
             # Format correlated events for the prompt (limit to avoid token overflow)
@@ -577,17 +614,18 @@ def main():
                 log_line=anomaly.get("original_log_line", anomaly.get("raw", "")),
                 hostname=hostname,
                 process=anomaly.get("process", "unknown"),
+                source_ip=corr.get("source_ip", "unknown"),
+                username=corr.get("username", "unknown"),
                 l2_threat_category=l2_category,
                 l2_severity=l2_severity,
                 l2_explanation=anomaly.get("llm_explanation", ""),
                 anomaly_score=anomaly.get("anomaly_score", 0),
-                window_sec=CORRELATION_WINDOW_SEC,
+                before_sec=CORRELATION_BEFORE_SEC,
+                after_sec=CORRELATION_AFTER_SEC,
                 correlated_events=events_text,
                 correlated_count=len(corr["events"]),
                 failed_auth_count=corr["failed_auth_count"],
                 success_auth_count=corr["success_auth_count"],
-                unique_ips=", ".join(corr["unique_ips"]) or "none found",
-                unique_hosts=", ".join(corr["unique_hosts"]) or "none found",
             )
 
             # --- Step 3: Send to LLM for final assessment ---
@@ -625,7 +663,7 @@ def main():
                     "correlated_events_text": correlated_events_text,
                     "failed_auth_count": corr["failed_auth_count"],
                     "success_auth_count": corr["success_auth_count"],
-                    "correlation_window_sec": CORRELATION_WINDOW_SEC,
+                    "correlation_window_sec": CORRELATION_BEFORE_SEC + CORRELATION_AFTER_SEC,
                     "l3_raw_response": json.dumps(llm_result),
                 }
             else:
@@ -654,7 +692,7 @@ def main():
                     "correlated_events_text": correlated_events_text,
                     "failed_auth_count": corr["failed_auth_count"],
                     "success_auth_count": corr["success_auth_count"],
-                    "correlation_window_sec": CORRELATION_WINDOW_SEC,
+                    "correlation_window_sec": CORRELATION_BEFORE_SEC + CORRELATION_AFTER_SEC,
                     "l3_raw_response": "",
                 }
 

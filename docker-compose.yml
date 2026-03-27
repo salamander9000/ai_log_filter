@@ -180,8 +180,9 @@ services:
       - PROD_ES_PASS=${PROD_ES_PASS:-}
       - PROD_ES_INDEX=${PROD_ES_INDEX:-logs-*}
       - PROD_ES_VERIFY_CERTS=${PROD_ES_VERIFY_CERTS:-false}
-      # Correlation settings
-      - CORRELATION_WINDOW_SEC=${CORRELATION_WINDOW_SEC:-300}
+      # Correlation settings - asymmetric window around the anomaly
+      - CORRELATION_BEFORE_SEC=${CORRELATION_BEFORE_SEC:-20}
+      - CORRELATION_AFTER_SEC=${CORRELATION_AFTER_SEC:-30}
       - MAX_CORRELATED_EVENTS=100
       # Delay before L3 analysis (seconds) - set >0 if follow-up events
       # (e.g., successful login after brute force) need time to be indexed
