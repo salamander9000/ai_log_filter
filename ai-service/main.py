@@ -52,8 +52,20 @@ CONTAMINATION = _contam_raw if _contam_raw == "auto" else float(_contam_raw)
 # Allowlist: templates seen in more than this % of training data are skipped
 ALLOWLIST_MIN_PCT = float(os.getenv("ALLOWLIST_MIN_PCT", "1.0"))
 
-# Input mode: "redis" or "file"
-INPUT_MODE = os.getenv("INPUT_MODE", "redis")
+# Input mode: "kafka", "redis", or "file"
+INPUT_MODE = os.getenv("INPUT_MODE", "kafka")
+
+# Kafka configuration (used when INPUT_MODE=kafka)
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "kafka:9093")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "logs")
+KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "ai-log-filter")
+KAFKA_SSL_CA = os.getenv("KAFKA_SSL_CA", "/app/certs/ca.crt")
+KAFKA_SSL_CERT = os.getenv("KAFKA_SSL_CERT", "/app/certs/client.crt")
+KAFKA_SSL_KEY = os.getenv("KAFKA_SSL_KEY", "/app/certs/client.key")
+KAFKA_AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
+
+# Rate limiter (0 = unlimited)
+RATE_LIMIT_PER_SEC = int(os.getenv("RATE_LIMIT_PER_SEC", "0"))
 
 # Number of LLM worker threads (async analysis of flagged events)
 LLM_WORKERS = int(os.getenv("LLM_WORKERS", "1"))
@@ -788,6 +800,8 @@ def setup_indices(client: OpenSearch):
                 "llm_avg_latency_ms": {"type": "float"},
                 "llm_queue_depth": {"type": "integer"},
                 "llm_dropped": {"type": "long"},
+                "rate_limit_passed": {"type": "long"},
+                "rate_limit_dropped": {"type": "long"},
             }
         },
         "settings": {
@@ -835,7 +849,8 @@ class StatsTracker:
         self.llm_total_latency += latency_ms
 
     def maybe_flush(self, model_trained: bool, buffer_size: int, unique_templates: int,
-                    llm_queue_depth: int = 0, llm_dropped: int = 0):
+                    llm_queue_depth: int = 0, llm_dropped: int = 0,
+                    rate_passed: int = 0, rate_dropped: int = 0):
         now = time.time()
         elapsed = now - self.last_flush
         if elapsed < self.flush_interval:
@@ -859,6 +874,8 @@ class StatsTracker:
             "llm_avg_latency_ms": round(avg_llm_latency, 1),
             "llm_queue_depth": llm_queue_depth,
             "llm_dropped": llm_dropped,
+            "rate_limit_passed": rate_passed,
+            "rate_limit_dropped": rate_dropped,
         }
 
         try:
@@ -869,11 +886,15 @@ class StatsTracker:
         self.last_flush = now
         self.last_total = self.total
 
+        rate_info = ""
+        if rate_dropped > 0:
+            rate_info = f" rate_passed={rate_passed} rate_dropped={rate_dropped}"
+
         log.info(
             "STATS | total=%d anomalies=%d rate=%.1f%% eps=%.1f templates=%d "
-            "llm_queries=%d llm_queue=%d llm_dropped=%d",
+            "llm_queries=%d llm_queue=%d llm_dropped=%d%s",
             self.total, self.anomalous, anomaly_rate, eps, unique_templates,
-            self.llm_queries, llm_queue_depth, llm_dropped,
+            self.llm_queries, llm_queue_depth, llm_dropped, rate_info,
         )
 
 
@@ -961,16 +982,170 @@ def consume_redis(redis_host: str, redis_key: str, shutdown: Event):
             time.sleep(5)
 
 
+# ---------------------------------------------------------------------------
+# Rate limiter (token bucket)
+# ---------------------------------------------------------------------------
+# Module-level reference so StatsTracker can access it from the main loop
+_rate_limiter: "RateLimiter | None" = None
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter. Drops excess messages silently.
+    Set rate=0 for unlimited (no rate limiting).
+
+    # FUTURE: Add logging of dropped messages (at minimum periodic stats).
+    # Currently drops silently for performance. The stats are tracked in
+    # StatsTracker via rate_passed/rate_dropped fields.
+    """
+
+    def __init__(self, rate_per_sec: int):
+        self.rate = rate_per_sec
+        self.tokens = float(rate_per_sec) if rate_per_sec > 0 else 0
+        self.last_refill = time.time()
+        self.dropped = 0
+        self.passed = 0
+        self.enabled = rate_per_sec > 0
+
+    def allow(self) -> bool:
+        if not self.enabled:
+            self.passed += 1
+            return True
+
+        now = time.time()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
+        self.last_refill = now
+
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            self.passed += 1
+            return True
+        else:
+            self.dropped += 1
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Kafka consumer (mTLS)
+# ---------------------------------------------------------------------------
+def consume_kafka(shutdown: Event):
+    """
+    Generator that yields syslog lines from a Kafka topic with mTLS auth.
+    Rate-limited via the global rate limiter.
+    """
+    from confluent_kafka import Consumer, KafkaError, KafkaException
+
+    log.info("[kafka] Connecting to %s, topic=%s, group=%s",
+             KAFKA_BROKERS, KAFKA_TOPIC, KAFKA_GROUP_ID)
+
+    conf = {
+        "bootstrap.servers": KAFKA_BROKERS,
+        "group.id": KAFKA_GROUP_ID,
+        "auto.offset.reset": KAFKA_AUTO_OFFSET_RESET,
+        "enable.auto.commit": True,
+        "auto.commit.interval.ms": 5000,
+        # mTLS
+        "security.protocol": "SSL",
+        "ssl.ca.location": KAFKA_SSL_CA,
+        "ssl.certificate.location": KAFKA_SSL_CERT,
+        "ssl.key.location": KAFKA_SSL_KEY,
+    }
+
+    # Check if cert files exist
+    for label, path in [("CA", KAFKA_SSL_CA), ("cert", KAFKA_SSL_CERT), ("key", KAFKA_SSL_KEY)]:
+        if not os.path.exists(path):
+            log.error("[kafka] %s certificate not found at %s", label, path)
+            log.error("[kafka] Place your Kafka mTLS certificates in the certs/ directory.")
+            log.error("[kafka] See certs/README.md for details.")
+            sys.exit(1)
+
+    global _rate_limiter
+    consumer = None
+    rate_limiter = RateLimiter(RATE_LIMIT_PER_SEC)
+    _rate_limiter = rate_limiter
+    if rate_limiter.enabled:
+        log.info("[kafka] Rate limiter: %d events/sec max", RATE_LIMIT_PER_SEC)
+    else:
+        log.info("[kafka] Rate limiter: disabled (unlimited)")
+
+    while not shutdown.is_set():
+        try:
+            if consumer is None:
+                consumer = Consumer(conf)
+                consumer.subscribe([KAFKA_TOPIC])
+                log.info("[kafka] Subscribed to topic '%s'. Consuming...", KAFKA_TOPIC)
+
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    # End of partition - normal, just continue
+                    continue
+                else:
+                    log.warning("[kafka] Consumer error: %s", msg.error())
+                    continue
+
+            # Decode message
+            raw = msg.value()
+            if raw is None:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+
+            if not line:
+                continue
+
+            # Rate limiting - silently drop excess
+            if not rate_limiter.allow():
+                continue
+
+            yield line
+
+        except KafkaException as e:
+            log.warning("[kafka] Kafka error: %s. Reconnecting in 5s...", e)
+            if consumer is not None:
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+                consumer = None
+            time.sleep(5)
+        except Exception as e:
+            log.error("[kafka] Unexpected error: %s. Reconnecting in 5s...", e)
+            if consumer is not None:
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+                consumer = None
+            time.sleep(5)
+
+    # Clean shutdown
+    if consumer is not None:
+        try:
+            consumer.close()
+        except Exception:
+            pass
+    log.info("[kafka] Consumer closed. Passed=%d, Dropped=%d",
+             rate_limiter.passed, rate_limiter.dropped)
+
+
 def get_input_source(shutdown: Event):
     """Return the appropriate input generator based on INPUT_MODE."""
-    if INPUT_MODE == "redis":
+    if INPUT_MODE == "kafka":
+        log.info("Input mode: KAFKA (mTLS, topic=%s, rate_limit=%s/s)",
+                 KAFKA_TOPIC, RATE_LIMIT_PER_SEC if RATE_LIMIT_PER_SEC > 0 else "unlimited")
+        return consume_kafka(shutdown)
+    elif INPUT_MODE == "redis":
         log.info("Input mode: REDIS (Filebeat -> Redis -> AI)")
         return consume_redis(REDIS_HOST, REDIS_KEY, shutdown)
     elif INPUT_MODE == "file":
         log.info("Input mode: FILE (tailing %s)", LOG_FILE)
         return tail_file(LOG_FILE, shutdown)
     else:
-        log.error("Unknown INPUT_MODE: %s (expected 'redis' or 'file')", INPUT_MODE)
+        log.error("Unknown INPUT_MODE: %s (expected 'kafka', 'redis' or 'file')", INPUT_MODE)
         sys.exit(1)
 
 
@@ -984,7 +1159,12 @@ def main():
     log.info("Config: INPUT_MODE=%s", INPUT_MODE)
     log.info("Config: OPENSEARCH_HOST=%s", OPENSEARCH_HOST)
     log.info("Config: OLLAMA_HOST=%s", OLLAMA_HOST)
-    if INPUT_MODE == "redis":
+    if INPUT_MODE == "kafka":
+        log.info("Config: KAFKA_BROKERS=%s", KAFKA_BROKERS)
+        log.info("Config: KAFKA_TOPIC=%s", KAFKA_TOPIC)
+        log.info("Config: KAFKA_GROUP_ID=%s", KAFKA_GROUP_ID)
+        log.info("Config: RATE_LIMIT_PER_SEC=%s", RATE_LIMIT_PER_SEC if RATE_LIMIT_PER_SEC > 0 else "unlimited")
+    elif INPUT_MODE == "redis":
         log.info("Config: REDIS_HOST=%s", REDIS_HOST)
         log.info("Config: REDIS_KEY=%s", REDIS_KEY)
     else:
@@ -1134,6 +1314,8 @@ def main():
             unique_templates=len(feature_extractor.seen_templates),
             llm_queue_depth=llm_worker.queue_depth if llm_worker else 0,
             llm_dropped=llm_worker.dropped if llm_worker else 0,
+            rate_passed=_rate_limiter.passed if _rate_limiter else 0,
+            rate_dropped=_rate_limiter.dropped if _rate_limiter else 0,
         )
 
     # Final flush

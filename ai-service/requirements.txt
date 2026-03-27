@@ -4,3 +4,4 @@ opensearch-py>=2.4,<3.0
 drain3>=0.9.11,<1.0
 requests>=2.31,<3.0
 redis>=5.0,<6.0
+confluent-kafka>=2.3,<3.0

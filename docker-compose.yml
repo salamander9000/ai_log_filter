@@ -38,11 +38,11 @@ services:
       opensearch:
         condition: service_healthy
 
-  # --- Redis buffer (input queue + Layer 3 queue) ---
+  # --- Redis (Layer 3 queue only, input comes from Kafka) ---
   redis:
     image: redis:7-alpine
     container_name: redis
-    command: redis-server --maxmemory 4gb --maxmemory-policy noeviction --appendonly no --save ""
+    command: redis-server --maxmemory 1gb --maxmemory-policy noeviction --appendonly no --save ""
     ports:
       - "6379:6379"
     networks:
@@ -69,7 +69,8 @@ services:
     networks:
       - lognet
 
-  # --- Syslog TCP/UDP receiver (accepts remote syslog, pushes to Redis) ---
+  # --- Syslog TCP/UDP receiver (alternative input, not needed with Kafka) ---
+  # FUTURE: consider removing entirely once Kafka is the primary input
   syslog-receiver:
     build:
       context: ./syslog-receiver
@@ -92,6 +93,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    profiles:
+      - syslog    # only starts with: docker compose --profile syslog up
 
   # --- Synthetic syslog generator (demo mode only) ---
   log-generator:
@@ -122,11 +125,22 @@ services:
     container_name: ai-log-service
     environment:
       - OPENSEARCH_HOST=http://opensearch:9200
-      # OLLAMA_HOST: Layer 2 Ollama pool via HAProxy
       - OLLAMA_HOST=${OLLAMA_HOST:-http://haproxy:11434}
+      # Input: Kafka with mTLS (default), Redis, or file
+      - INPUT_MODE=${INPUT_MODE:-kafka}
+      # Kafka settings
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:9093}
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-logs}
+      - KAFKA_GROUP_ID=${KAFKA_GROUP_ID:-ai-log-filter}
+      - KAFKA_SSL_CA=/app/certs/ca.crt
+      - KAFKA_SSL_CERT=/app/certs/client.crt
+      - KAFKA_SSL_KEY=/app/certs/client.key
+      - KAFKA_AUTO_OFFSET_RESET=${KAFKA_AUTO_OFFSET_RESET:-latest}
+      # Rate limiter (0 = unlimited)
+      - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-0}
+      # Redis (still needed for L2->L3 queue)
       - REDIS_HOST=redis://redis:6379
       - REDIS_KEY=filebeat:logs
-      - INPUT_MODE=${INPUT_MODE:-redis}
       - LOG_FILE=/var/log/synthetic/syslog
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:0.5b}
       - LLM_ENABLED=true
@@ -144,6 +158,7 @@ services:
       - L3_SEVERITY_FILTER=high,critical
     volumes:
       - shared-logs:/var/log/synthetic:ro
+      - ./certs:/app/certs:ro
     networks:
       - lognet
     depends_on:

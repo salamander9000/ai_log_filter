@@ -14,3 +14,9 @@ pip.conf
 # HAProxy config (contains real server hostnames - do not commit)
 # Copy haproxy/haproxy.cfg.example to haproxy/haproxy.cfg and fill in your servers.
 haproxy/haproxy.cfg
+
+# Kafka mTLS certificates (sensitive - do not commit)
+# Place ca.crt, client.crt, client.key in certs/
+certs/*.crt
+certs/*.key
+certs/*.pem
