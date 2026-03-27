@@ -183,6 +183,9 @@ services:
       # Correlation settings
       - CORRELATION_WINDOW_SEC=${CORRELATION_WINDOW_SEC:-300}
       - MAX_CORRELATED_EVENTS=100
+      # Delay before L3 analysis (seconds) - set >0 if follow-up events
+      # (e.g., successful login after brute force) need time to be indexed
+      - L3_DELAY_SEC=${L3_DELAY_SEC:-0}
       - L3_SEVERITY_FILTER=high,critical
     networks:
       - lognet

@@ -102,13 +102,13 @@ create_object "visualization" "viz-l3-pending" "${TMPDIR}/b.json"
 
 echo "  Layer 3: Confirmed Threats Detail (table)"
 cat > "${TMPDIR}/b.json" <<'EOF'
-{"attributes":{"title":"Layer 3: Confirmed Threats Detail","description":"Only confirmed threats","columns":["@timestamp","hostname","attack_type","severity","confidence_pct","narrative","evidence_summary","immediate_actions"],"sort":[["@timestamp","desc"]],"kibanaSavedObjectMeta":{"searchSourceJSON":"{\"index\":\"logs-threats\",\"query\":{\"query\":\"confirmed:true\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"}}}
+{"attributes":{"title":"Layer 3: Confirmed Threats Detail","description":"Only confirmed threats - with correlated events for full context","columns":["@timestamp","hostname","attack_type","severity","confidence_pct","narrative","evidence_summary","correlated_events_text","failed_auth_count","success_auth_count","immediate_actions"],"sort":[["@timestamp","desc"]],"kibanaSavedObjectMeta":{"searchSourceJSON":"{\"index\":\"logs-threats\",\"query\":{\"query\":\"confirmed:true\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"}}}
 EOF
 create_object "search" "search-l3-confirmed" "${TMPDIR}/b.json"
 
 echo "  Layer 3: All Results (table)"
 cat > "${TMPDIR}/b.json" <<'EOF'
-{"attributes":{"title":"Layer 3: All Results (confirmed + false positive)","description":"Everything L3 analyzed","columns":["@timestamp","hostname","confirmed","attack_type","severity","confidence_pct","narrative","evidence_summary","correlated_events_count"],"sort":[["@timestamp","desc"]],"kibanaSavedObjectMeta":{"searchSourceJSON":"{\"index\":\"logs-threats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"}}}
+{"attributes":{"title":"Layer 3: All Results (confirmed + false positive)","description":"Everything L3 analyzed - with correlated events","columns":["@timestamp","hostname","confirmed","attack_type","severity","confidence_pct","narrative","evidence_summary","correlated_events_text","failed_auth_count","success_auth_count","correlated_events_count"],"sort":[["@timestamp","desc"]],"kibanaSavedObjectMeta":{"searchSourceJSON":"{\"index\":\"logs-threats\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[],\"highlightAll\":true,\"version\":true}"}}}
 EOF
 create_object "search" "search-l3-all" "${TMPDIR}/b.json"
 

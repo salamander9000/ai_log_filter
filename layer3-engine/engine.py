@@ -55,6 +55,9 @@ OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "http://opensearch:9200")
 # Correlation settings
 CORRELATION_WINDOW_SEC = int(os.getenv("CORRELATION_WINDOW_SEC", "300"))
 MAX_CORRELATED_EVENTS = int(os.getenv("MAX_CORRELATED_EVENTS", "100"))
+# Delay before L3 analysis (seconds) - gives time for follow-up events
+# (e.g., successful login after brute force) to be indexed
+L3_DELAY_SEC = int(os.getenv("L3_DELAY_SEC", "0"))
 
 # Only process events with these LLM severities from Layer 2
 L3_SEVERITY_FILTER = os.getenv("L3_SEVERITY_FILTER", "high,critical").split(",")
@@ -212,6 +215,7 @@ def setup_threats_index(client: OpenSearch):
                 "severity": {"type": "keyword"},
                 "evidence_summary": {"type": "text"},
                 "correlated_events_count": {"type": "integer"},
+                "correlated_events_text": {"type": "text"},
                 "failed_auth_count": {"type": "integer"},
                 "success_auth_count": {"type": "integer"},
                 "correlation_window_sec": {"type": "integer"},
@@ -235,15 +239,65 @@ def setup_threats_index(client: OpenSearch):
 
 
 # ---------------------------------------------------------------------------
-# Correlation queries against production ES
+# Correlation queries - bidirectional (before + after the anomaly)
 # ---------------------------------------------------------------------------
-def query_correlated_events(es_client: Elasticsearch, anomaly: dict,
-                            window_sec: int, max_events: int) -> dict:
+def _count_auth_events(result: dict, msg: str):
+    """Count failed/successful auth events in a message."""
+    msg_lower = msg.lower()
+    if any(kw in msg_lower for kw in ["failed password", "authentication fail",
+                                        "invalid user", "auth fail",
+                                        "maximum authentication attempts"]):
+        result["failed_auth_count"] += 1
+    if any(kw in msg_lower for kw in ["accepted password", "accepted publickey",
+                                        "session opened for user"]):
+        result["success_auth_count"] += 1
+
+
+def _run_correlation_query(client, index: str, query: dict, result: dict,
+                           source_label: str, use_body_kwarg: bool = True):
+    """Run a correlation query and accumulate results."""
+    try:
+        if use_body_kwarg:
+            resp = client.search(index=index, body=query)
+        else:
+            resp = client.search(index=index, body=query)
+        hits = resp.get("hits", {}).get("hits", [])
+
+        for hit in hits:
+            src = hit.get("_source", {})
+            msg = src.get("message", "")
+            ts = src.get("@timestamp", "")
+            host = src.get("hostname", "")
+
+            result["events"].append(f"[{ts}] {host}: {msg}")
+            result["unique_hosts"].add(host)
+
+            for ip in extract_ips(msg):
+                result["unique_ips"].add(ip)
+
+            _count_auth_events(result, msg)
+
+        log.info("[%s] Correlation returned %d events (failed_auth=%d, success_auth=%d)",
+                 source_label, len(hits), result["failed_auth_count"], result["success_auth_count"])
+
+    except Exception as e:
+        log.warning("[%s] Correlation query failed: %s", source_label, e)
+
+
+def query_correlated_events(es_client: Elasticsearch, os_client: OpenSearch,
+                            anomaly: dict, window_sec: int, max_events: int) -> dict:
     """
-    Query production ES for events correlated to the anomaly.
+    Query for events correlated to the anomaly using a BIDIRECTIONAL time
+    window (before AND after the anomaly timestamp).
+
+    Queries production ES if configured, otherwise falls back to the local
+    PoC OpenSearch (logs-processed index).
+
+    Specifically looks for successful logins after failed auth attempts
+    to detect brute force with successful breach.
 
     Returns a dict with:
-      - events: list of correlated log lines
+      - events: list of correlated log lines (chronological)
       - failed_auth_count: number of auth failure events
       - success_auth_count: number of successful auth events
       - unique_ips: list of unique source IPs
@@ -257,33 +311,30 @@ def query_correlated_events(es_client: Elasticsearch, anomaly: dict,
         "unique_hosts": set(),
     }
 
-    if es_client is None:
-        result["unique_ips"] = list(result["unique_ips"])
-        result["unique_hosts"] = list(result["unique_hosts"])
-        return result
-
     # Extract context from the anomaly
     hostname = anomaly.get("hostname", "")
     message = anomaly.get("message", anomaly.get("original_log_line", ""))
     source_ips = extract_ips(message)
-    process = anomaly.get("process", "")
 
-    # Build the ES query - search for related events
-    time_range = {"range": {"@timestamp": {"gte": f"now-{window_sec}s"}}}
+    # Build bidirectional time range anchored on the anomaly timestamp
+    # Look BEFORE and AFTER the event to catch follow-up actions (e.g., successful login after brute force)
+    anomaly_ts = anomaly.get("@timestamp", "")
+    if anomaly_ts:
+        time_range = {"range": {"@timestamp": {
+            "gte": f"{anomaly_ts}||-{window_sec}s",
+            "lte": f"{anomaly_ts}||+{window_sec}s",
+        }}}
+    else:
+        # Fallback: use now-based window if no timestamp available
+        time_range = {"range": {"@timestamp": {"gte": f"now-{window_sec}s"}}}
 
-    # Strategy: query by source IP (if found) OR by hostname+process
+    # Build should clauses: match by source IP or by hostname
     should_clauses = []
     if source_ips:
         for ip in source_ips:
-            should_clauses.append({"match": {"message": ip}})
+            should_clauses.append({"match_phrase": {"message": ip}})
     if hostname:
-        should_clauses.append({
-            "bool": {
-                "must": [
-                    {"match": {"message": hostname}},
-                ]
-            }
-        })
+        should_clauses.append({"term": {"hostname": hostname}})
 
     if not should_clauses:
         log.warning("No correlation criteria found for anomaly.")
@@ -304,37 +355,45 @@ def query_correlated_events(es_client: Elasticsearch, anomaly: dict,
         "_source": ["@timestamp", "message", "hostname"],
     }
 
-    try:
-        resp = es_client.search(index=PROD_ES_INDEX, body=query)
-        hits = resp.get("hits", {}).get("hits", [])
+    # Query production ES if available
+    if es_client is not None:
+        _run_correlation_query(es_client, PROD_ES_INDEX, query, result, "prod-ES")
 
-        for hit in hits:
-            src = hit.get("_source", {})
-            msg = src.get("message", "")
-            ts = src.get("@timestamp", "")
-            host = src.get("hostname", "")
+    # Also/alternatively query local PoC OpenSearch (logs-processed)
+    # This catches events that went through our pipeline even without prod ES
+    if os_client is not None and not result["events"]:
+        _run_correlation_query(os_client, "logs-processed", query, result, "local-OS")
 
-            result["events"].append(f"[{ts}] {host}: {msg}")
-            result["unique_hosts"].add(host)
+    # If we found failed auth but no successful auth yet, do a targeted
+    # search specifically for successful logins (they might use different
+    # hostnames or not match the broad query)
+    if result["failed_auth_count"] > 0 and result["success_auth_count"] == 0:
+        success_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        time_range,
+                        {"bool": {"should": [
+                            {"match_phrase": {"message": "Accepted password"}},
+                            {"match_phrase": {"message": "Accepted publickey"}},
+                        ], "minimum_should_match": 1}},
+                    ],
+                    "should": should_clauses,
+                    "minimum_should_match": 1,
+                }
+            },
+            "sort": [{"@timestamp": {"order": "asc"}}],
+            "size": 20,
+            "_source": ["@timestamp", "message", "hostname"],
+        }
 
-            # Extract IPs from correlated events
-            for ip in extract_ips(msg):
-                result["unique_ips"].add(ip)
+        if es_client is not None:
+            _run_correlation_query(es_client, PROD_ES_INDEX, success_query, result, "prod-ES-success-check")
+        elif os_client is not None:
+            _run_correlation_query(os_client, "logs-processed", success_query, result, "local-OS-success-check")
 
-            # Count auth events
-            msg_lower = msg.lower()
-            if any(kw in msg_lower for kw in ["failed password", "authentication fail",
-                                                "invalid user", "auth fail"]):
-                result["failed_auth_count"] += 1
-            if any(kw in msg_lower for kw in ["accepted password", "accepted publickey",
-                                                "session opened"]):
-                result["success_auth_count"] += 1
-
-        log.info("Correlation query returned %d events (failed_auth=%d, success_auth=%d)",
-                 len(hits), result["failed_auth_count"], result["success_auth_count"])
-
-    except Exception as e:
-        log.warning("ES correlation query failed: %s", e)
+    # Sort all events chronologically and deduplicate
+    result["events"] = sorted(set(result["events"]))
 
     # Convert sets to lists for JSON serialization
     result["unique_ips"] = list(result["unique_ips"])
@@ -490,18 +549,28 @@ def main():
                 l2_category, l2_severity, hostname, doc_id[:12],
             )
 
-            # --- Step 1: Query production ES for correlated events ---
+            # --- Optional delay to let follow-up events be indexed ---
+            if L3_DELAY_SEC > 0:
+                log.debug("Delaying L3 analysis by %ds for %s", L3_DELAY_SEC, doc_id[:12])
+                time.sleep(L3_DELAY_SEC)
+
+            # --- Step 1: Query for correlated events (bidirectional window) ---
             corr = query_correlated_events(
-                prod_es, anomaly, CORRELATION_WINDOW_SEC, MAX_CORRELATED_EVENTS,
+                prod_es, os_client, anomaly, CORRELATION_WINDOW_SEC, MAX_CORRELATED_EVENTS,
             )
 
             # Format correlated events for the prompt (limit to avoid token overflow)
             if corr["events"]:
-                events_text = "\n".join(corr["events"][:50])  # max 50 events in prompt
+                events_text = "\n".join(corr["events"][:50])
                 if len(corr["events"]) > 50:
                     events_text += f"\n... and {len(corr['events']) - 50} more events"
             else:
-                events_text = "(No correlated events found in production ES)"
+                events_text = "(No correlated events found)"
+
+            # Build correlated events text for storage in the threat doc
+            correlated_events_text = "\n".join(corr["events"][:20])
+            if len(corr["events"]) > 20:
+                correlated_events_text += f"\n... and {len(corr['events']) - 20} more"
 
             # --- Step 2: Build enriched prompt ---
             prompt = L3_PROMPT_TEMPLATE.format(
@@ -553,6 +622,7 @@ def main():
                     "severity": llm_result.get("severity", "unknown"),
                     "evidence_summary": llm_result.get("evidence_summary", ""),
                     "correlated_events_count": len(corr["events"]),
+                    "correlated_events_text": correlated_events_text,
                     "failed_auth_count": corr["failed_auth_count"],
                     "success_auth_count": corr["success_auth_count"],
                     "correlation_window_sec": CORRELATION_WINDOW_SEC,
@@ -581,6 +651,7 @@ def main():
                     "severity": l2_severity,
                     "evidence_summary": f"L2 flagged as {l2_category}/{l2_severity}. L3 LLM could not analyze. Correlated events: {len(corr['events'])}",
                     "correlated_events_count": len(corr["events"]),
+                    "correlated_events_text": correlated_events_text,
                     "failed_auth_count": corr["failed_auth_count"],
                     "success_auth_count": corr["success_auth_count"],
                     "correlation_window_sec": CORRELATION_WINDOW_SEC,
