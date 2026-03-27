@@ -62,7 +62,10 @@ KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "ai-log-filter")
 KAFKA_SSL_CA = os.getenv("KAFKA_SSL_CA", "/app/certs/ca.crt")
 KAFKA_SSL_CERT = os.getenv("KAFKA_SSL_CERT", "/app/certs/client.crt")
 KAFKA_SSL_KEY = os.getenv("KAFKA_SSL_KEY", "/app/certs/client.key")
+KAFKA_SSL_KEY_PASSWORD = os.getenv("KAFKA_SSL_KEY_PASSWORD", "")
 KAFKA_AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
+# Set to "none" when connecting via HA proxy (broker cert CN won't match proxy hostname)
+KAFKA_SSL_ENDPOINT_ALGO = os.getenv("KAFKA_SSL_ENDPOINT_ALGO", "none")
 
 # Rate limiter (0 = unlimited)
 RATE_LIMIT_PER_SEC = int(os.getenv("RATE_LIMIT_PER_SEC", "0"))
@@ -1050,7 +1053,13 @@ def consume_kafka(shutdown: Event):
         "ssl.ca.location": KAFKA_SSL_CA,
         "ssl.certificate.location": KAFKA_SSL_CERT,
         "ssl.key.location": KAFKA_SSL_KEY,
+        # Required when connecting via HA proxy (cert CN != proxy hostname)
+        "ssl.endpoint.identification.algorithm": KAFKA_SSL_ENDPOINT_ALGO,
     }
+
+    # Optional: key password (if private key is password-protected)
+    if KAFKA_SSL_KEY_PASSWORD:
+        conf["ssl.key.password"] = KAFKA_SSL_KEY_PASSWORD
 
     # Check if cert files exist
     for label, path in [("CA", KAFKA_SSL_CA), ("cert", KAFKA_SSL_CERT), ("key", KAFKA_SSL_KEY)]:

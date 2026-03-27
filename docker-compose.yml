@@ -135,7 +135,10 @@ services:
       - KAFKA_SSL_CA=/app/certs/ca.crt
       - KAFKA_SSL_CERT=/app/certs/client.crt
       - KAFKA_SSL_KEY=/app/certs/client.key
+      - KAFKA_SSL_KEY_PASSWORD=${KAFKA_SSL_KEY_PASSWORD:-}
       - KAFKA_AUTO_OFFSET_RESET=${KAFKA_AUTO_OFFSET_RESET:-latest}
+      # Set to "none" for HA proxy (cert CN won't match proxy hostname)
+      - KAFKA_SSL_ENDPOINT_ALGO=${KAFKA_SSL_ENDPOINT_ALGO:-none}
       # Rate limiter (0 = unlimited)
       - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-0}
       # Redis (still needed for L2->L3 queue)
