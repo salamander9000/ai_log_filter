@@ -1,264 +1,166 @@
-# AI Log Filter PoC
+# AI Log Filter
 
 CPU-based AI log filtering and anomaly detection for SIEM environments.
-Proof of concept to evaluate local AI capabilities before committing to dedicated AI hardware.
-
-## What It Does
-
-1. **Ingests** syslog data via Filebeat -> Redis, or from a synthetic generator (demo mode)
-2. **Parses** logs using Drain3 (log template extraction)
-3. **Detects anomalies** using Isolation Forest (unsupervised ML, CPU-native)
-4. **Classifies threats** using a small local LLM via Ollama (Qwen2.5-3B, CPU inference)
-5. **Visualizes** everything in OpenSearch Dashboards
+Three-layer architecture: ML scoring -> LLM classification -> threat correlation.
 
 ## Architecture
 
-### Real mode - syslog-ng (recommended)
-
 ```
-Remote servers                    Docker stack (AI server)
-──────────────                    ────────────────────────
-
-syslog-ng ──TCP:5514──> syslog-receiver ──> Redis ──> AI Service ──> OpenSearch
-                        (container)         (buffer)                  + Dashboards
-                                                          │
-inject-anomalies.sh ──> /var/log/messages                Ollama (LLM)
-(testing)               ──> syslog-ng (loops back)       Qwen3.5-0.8B on CPU
-```
-
-### Real mode - Filebeat
-
-```
-/var/log/messages ──> Filebeat ──> Redis ──> AI Service ──> OpenSearch + Dashboards
-                      (host)       (buffer)
-```
-
-### Demo mode (synthetic generator)
-
-```
-log-generator ──> shared volume ──> AI Service ──> OpenSearch + Dashboards
+Kafka (mTLS) ──> AI Service (Layer 1 + Layer 2) ──> OpenSearch + Dashboards
+                       │              │
+                  Isolation Forest   HAProxy:11434 ──> Ollama L2 pool
+                  (microseconds)     (qwen2.5:0.5b)
+                       │
+                  high/critical
+                       │
+                  Redis queue
+                       │
+                  Layer 3 Engine
+                       │
+                  HAProxy:11435 ──> Ollama L3 pool
+                  (qwen2.5:3b)
+                       │
+                  Production ES query
+                       │
+                  logs-threats ──> Dashboard
 ```
 
-Both syslog-ng and Filebeat can feed the pipeline simultaneously - they both
-push to the same Redis list.
+### Three Layers
 
-### AI Pipeline (Two Layers)
+| Layer | What it does | Speed | Technology |
+|---|---|---|---|
+| **Layer 1** | ML anomaly scoring on every event | ~thousands/sec | Drain3 + Isolation Forest |
+| **Layer 2** | LLM threat classification on anomalies only | ~10-40/min per server | Ollama (small model) |
+| **Layer 3** | Correlation with historical data, breach detection | ~5-15/min per server | Ollama (larger model) + ES queries |
 
-- **Layer 1 - Classical ML (fast):** Drain3 log parsing + feature extraction + Isolation Forest.
-  Handles full event volume. Runs at thousands of events/sec on CPU.
-- **Layer 2 - Local LLM (slow but smart):** Only processes events flagged by Layer 1.
-  Provides threat classification, severity, explanation, and recommended action.
+### Key Features
 
-## Prerequisites
+- **Kafka mTLS consumer** with configurable rate limiting
+- **Template allowlisting** - high-frequency log templates automatically bypass scoring
+- **Async LLM workers** - Layer 1 never blocks on LLM inference
+- **Multi-server Ollama** via HAProxy load balancer with separate L2/L3 pools
+- **Breach detection** - bidirectional correlation scoped to same source IP + username
+- **Thinking mode disabled** for Ollama models (`think: false` API parameter)
 
-- Docker and Docker Compose
-- ~4GB RAM minimum (8GB+ recommended)
-- ~3GB disk for the LLM model (downloaded on first run)
-- syslog-ng or Filebeat on the host/remote servers (for real mode)
+## Quick Start
 
-## Quick Start - Real Mode (syslog-ng)
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the complete step-by-step guide.
 
 ```bash
-# 1. Start the stack (Redis mode is the default)
-docker compose up -d
+# 1. Clone and configure
+git clone <repo-url> ai_log_filter && cd ai_log_filter
+cp .env.example .env                          # edit with your values
+cp haproxy/haproxy.cfg.example haproxy/haproxy.cfg  # edit with Ollama server IPs
+mkdir -p certs && cp /path/to/*.crt /path/to/*.key certs/  # Kafka mTLS certs
 
-# 2. Configure syslog-ng to forward to the AI server (see below)
+# 2. Build and start
+docker compose up -d --build
 
-# 3. Wait ~2 minutes for OpenSearch + Ollama to be ready
-
-# 4. Set up dashboards (run once)
+# 3. Setup dashboards
 ./dashboards/setup-dashboards.sh
 
-# 5. Open the dashboard
-#    http://localhost:5601/app/dashboards#/view/dashboard-ai-log-filter
-
-# 6. Inject some anomalies to test detection
-./scripts/inject-anomalies.sh brute_force 20
-./scripts/inject-anomalies.sh oom 5
-./scripts/inject-anomalies.sh all 30
+# 4. Open dashboard
+# http://<server>:5601/app/dashboards#/view/dashboard-ai-log-filter
 ```
 
-### syslog-ng configuration
+## Dashboard
 
-Add this to your syslog-ng config (e.g., `/etc/syslog-ng/syslog-ng.conf` or a
-file in `/etc/syslog-ng/conf.d/`):
+7-row dashboard with clear Layer 1/2/3 labeling:
 
-```
-# Forward to AI Log Filter
-destination d_ai_filter {
-    tcp("<AI_SERVER_IP>" port(5514));
-};
+| Row | Content |
+|---|---|
+| 1 | Layer 3: Total Analyzed, Confirmed Threats, Confirmed vs FP, Attack Types |
+| 2 | Layer 3: Confirmed Threats Detail (with correlated events) |
+| 3 | Layer 3: All Results (confirmed + false positive + failed) |
+| 4 | Layer 2: Threat Categories, Severity, L2 Pending, L3 Pending, Queue Depth |
+| 5 | Layer 2: LLM Analysis Results |
+| 6 | Layer 1: Events Over Time, Anomaly Score Distribution, Top Hosts |
+| 7 | Layer 1: Suspicious Patterns, Throughput, Anomaly Rate |
 
-log {
-    source(s_sys);              # your existing source
-    destination(d_ai_filter);
-    # Keep existing destinations too - this is just a copy:
-    # destination(d_mesg);
-};
-```
+## Input Modes
 
-Replace `<AI_SERVER_IP>` with the IP of the server running the Docker stack.
-Port **5514** accepts both TCP and UDP.
-
-To forward from the **local** machine (AI server itself):
-
-```
-destination d_ai_filter {
-    tcp("127.0.0.1" port(5514));
-};
-```
-
-Reload syslog-ng: `sudo systemctl reload syslog-ng`
-
-## Quick Start - Real Mode (Filebeat alternative)
-
-```bash
-# 1. Start the stack
-docker compose up -d
-
-# 2. Install Filebeat config on the host
-sudo cp filebeat/filebeat.yml /etc/filebeat/filebeat.yml
-sudo systemctl restart filebeat
-
-# 3. Wait ~2 min, set up dashboards
-./dashboards/setup-dashboards.sh
-
-# 4. Inject anomalies
-./scripts/inject-anomalies.sh all 30
-```
-
-## Quick Start - Demo Mode (Synthetic Logs)
-
-```bash
-# Start with demo profile (includes the synthetic log generator)
-INPUT_MODE=file docker compose --profile demo up -d
-
-# Set up dashboards
-./dashboards/setup-dashboards.sh
-```
-
-## Anomaly Injection
-
-The `scripts/inject-anomalies.sh` script injects realistic anomalous events
-into `/var/log/messages` via the `logger` command (proper syslog formatting).
-syslog-ng/Filebeat picks them up and pushes through the full pipeline.
-
-```bash
-./scripts/inject-anomalies.sh list              # show all scenarios
-./scripts/inject-anomalies.sh brute_force 20    # 20 SSH brute force attempts
-./scripts/inject-anomalies.sh oom 5             # 5 OOM kills
-./scripts/inject-anomalies.sh segfault 3        # 3 segfaults/crashes
-./scripts/inject-anomalies.sh privesc 10        # 10 privilege escalation attempts
-./scripts/inject-anomalies.sh disk_full 3       # 3 disk full events
-./scripts/inject-anomalies.sh network 5         # 5 network anomalies (SYN flood)
-./scripts/inject-anomalies.sh service_failure 5 # 5 service restart failures
-./scripts/inject-anomalies.sh access_denied 5   # 5 permission denied events
-./scripts/inject-anomalies.sh all 30            # 30 random mixed anomalies
-```
-
-## Accessing the Stack
-
-| Service | URL / Port |
-|---------|------------|
-| OpenSearch Dashboards | http://localhost:5601 |
-| OpenSearch API | http://localhost:9200 |
-| Ollama API | http://localhost:11434 |
-| Syslog receiver | TCP+UDP port 5514 |
-| Redis | localhost:6379 |
+| Mode | Command | Source |
+|---|---|---|
+| **kafka** (default) | `docker compose up -d` | Kafka topic with mTLS |
+| **redis** | `INPUT_MODE=redis` + `--profile syslog` | syslog-ng -> syslog-receiver -> Redis |
+| **file** | `INPUT_MODE=file` + `--profile demo` | Synthetic log generator |
 
 ## Configuration
 
-All configuration is via environment variables in `docker-compose.yml` or `.env`:
+All via `.env` file (see `.env.example` for complete reference).
 
-### AI Service
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `INPUT_MODE` | `redis` | Input source: `redis` (Filebeat) or `file` (tail log file) |
-| `REDIS_HOST` | `redis://redis:6379` | Redis connection URL |
-| `REDIS_KEY` | `filebeat:logs` | Redis list key to consume from |
-| `LOG_FILE` | `/var/log/synthetic/syslog` | Log file to tail (when INPUT_MODE=file) |
-| `OPENSEARCH_HOST` | `http://opensearch:9200` | OpenSearch endpoint |
-| `OLLAMA_HOST` | `http://ollama:11434` | Ollama endpoint |
-| `LLM_MODEL` | `qwen3.5:0.8b` | Ollama model name |
-| `LLM_ENABLED` | `true` | Enable/disable LLM analysis |
-| `ANOMALY_THRESHOLD` | `-0.4` | Isolation Forest anomaly threshold (more negative = stricter) |
-| `TRAINING_WINDOW` | `5000` | Number of events before first model training |
-| `CONTAMINATION` | `0.01` | Expected fraction of anomalies in the data (0.01 = 1%) |
-| `BATCH_SIZE` | `50` | OpenSearch bulk indexing batch size |
-
-### Log Generator (demo mode only)
+### Key settings
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `EVENTS_PER_SEC` | `5` | Log generation rate |
-| `ANOMALY_RATIO` | `0.05` | Fraction of events that are anomalous (0.05 = 5%) |
+|---|---|---|
+| `INPUT_MODE` | `kafka` | Input source |
+| `KAFKA_BROKERS` | `kafka:9093` | Kafka bootstrap servers |
+| `KAFKA_TOPIC` | `logs` | Topic to consume |
+| `KAFKA_SSL_ENDPOINT_ALGO` | `none` | Set to `none` for HA proxy |
+| `KAFKA_SSL_KEY_PASSWORD` | (empty) | Only if private key is password-protected |
+| `RATE_LIMIT_PER_SEC` | `0` | Max events/sec (0=unlimited) |
+| `LLM_MODEL` | `qwen2.5:0.5b` | Layer 2 model |
+| `L3_LLM_MODEL` | `qwen2.5:3b` | Layer 3 model |
+| `LLM_WORKERS` | `12` | Concurrent LLM requests |
+| `ANOMALY_THRESHOLD` | `-0.6` | Score cutoff (more negative = stricter) |
+| `TRAINING_WINDOW` | `5000` | Events before first ML training |
+| `CONTAMINATION` | `auto` | Anomaly fraction (`auto` or float) |
+| `ALLOWLIST_MIN_PCT` | `1.0` | Templates >N% of events are skipped |
 
-### Proxy (corporate environments)
+### Tuning
 
-```bash
-cp .env.example .env
-# Edit .env with your proxy URL
+- **Too many false positives?** Lower threshold (`-0.7`), increase training window (`10000`), lower allowlist (`0.5`)
+- **Missing real anomalies?** Raise threshold (`-0.4`), raise allowlist (`3.0`)
+- **LLM too slow?** Use smaller model (`qwen2.5:0.5b`), add more Ollama servers
+- **LLM quality too low?** Use larger model (`qwen2.5:3b` or `qwen2.5:7b`)
+
+## Documentation
+
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** - Complete server setup and deployment guide
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Technical deep dive into how each component works
+- **[FUTURE.md](FUTURE.md)** - Planned features (watchlist, source-type pipelines, MCP)
+- **[certs/README.md](certs/README.md)** - Kafka certificate setup and JKS conversion
+
+## File Structure
+
 ```
-
-### Pip mirror (corporate environments)
-
-```bash
-cp pip.conf.example ai-service/pip.conf
-# Edit ai-service/pip.conf with your internal PyPI mirror
+ai_log_filter/
+├── docker-compose.yml              # All services
+├── .env.example                    # Configuration template
+├── .gitignore
+├── ai-service/
+│   ├── Dockerfile                  # Python 3.12 + librdkafka
+│   ├── requirements.txt            # numpy, sklearn, opensearch-py, drain3, confluent-kafka, redis
+│   └── main.py                     # Layer 1 (Isolation Forest) + Layer 2 (LLM) + Kafka consumer
+├── layer3-engine/
+│   ├── Dockerfile
+│   ├── requirements.txt            # redis, requests, opensearch-py, elasticsearch
+│   └── engine.py                   # Layer 3 correlation + breach detection
+├── haproxy/
+│   ├── Dockerfile
+│   └── haproxy.cfg.example         # Template (copy to haproxy.cfg, fill in servers)
+├── certs/
+│   └── README.md                   # Certificate setup instructions
+├── syslog-receiver/                # Alternative input (syslog profile)
+├── sample-logs/                    # Synthetic generator (demo profile)
+├── dashboards/
+│   └── setup-dashboards.sh         # Auto-provision 18 visualizations + dashboard
+├── scripts/
+│   ├── setup-ollama-node.sh        # Bare metal Ollama server setup
+│   └── inject-anomalies.sh         # 8 anomaly injection scenarios
+├── filebeat/
+│   └── filebeat.yml                # Reference config for Filebeat input
+├── README.md
+├── DEPLOYMENT.md                   # Step-by-step deployment guide
+├── ARCHITECTURE.md                 # Technical architecture documentation
+└── FUTURE.md                       # Planned features
 ```
-
-## Redis Buffer
-
-Redis sits between Filebeat and the AI service as a backpressure buffer.
-If the AI service processes slower than the incoming rate (especially during
-LLM analysis), events queue in Redis instead of being lost.
-
-- Default max memory: 4GB (configurable in docker-compose.yml)
-- Policy: `noeviction` - returns error when full rather than dropping logs
-- No disk persistence - pure in-memory buffer for speed
-- With 256GB RAM on the server, you can increase the limit significantly
-
-Check Redis queue depth:
-```bash
-docker exec redis redis-cli LLEN filebeat:logs
-```
-
-## Using with Kafka (Production Path)
-
-For production, the `INPUT_MODE` concept makes it easy to add a Kafka consumer
-as a third input source. The architecture already separates input from processing.
 
 ## OpenSearch Indices
 
-| Index | Contents |
-|-------|----------|
-| `logs-processed` | All logs with anomaly scores |
-| `logs-anomalies` | Only flagged events with LLM analysis |
-| `logs-stats` | Processing statistics (throughput, anomaly rate, etc.) |
-
-## Stopping
-
-```bash
-docker compose down
-
-# To also remove data volumes:
-docker compose down -v
-```
-
-## Tuning Tips
-
-- **Too many false positives?** Lower `ANOMALY_THRESHOLD` (e.g., `-0.5`). Increase `TRAINING_WINDOW` (e.g., `10000`). Lower `CONTAMINATION` (e.g., `0.005`).
-- **Missing real anomalies?** Raise `ANOMALY_THRESHOLD` (e.g., `-0.2`). Raise `CONTAMINATION` (e.g., `0.03`).
-- **LLM too slow?** The default `qwen3.5:0.8b` is already very fast. If still too slow, set `LLM_ENABLED=false` to run ML-only.
-- **Want better LLM quality?** Try `qwen3.5:2b` or `qwen3.5:9b` if you have enough RAM. Larger models give more accurate threat classification at the cost of throughput.
-- **Redis queue growing?** Increase `BATCH_SIZE`, or set `LLM_ENABLED=false` to speed up processing.
-
-## What This PoC Demonstrates
-
-- Feasibility of CPU-only AI for log analysis
-- Processing throughput per CPU core
-- Accuracy of anomaly detection on real syslog data
-- LLM inference latency on CPU
-- End-to-end pipeline: Filebeat -> Redis -> AI -> OpenSearch
-- Clear data to project "with GPU we could handle Nx more volume"
+| Index | Content |
+|---|---|
+| `logs-processed` | All events with anomaly scores (Layer 1 output) |
+| `logs-anomalies` | Flagged events with LLM analysis (Layer 2 output) |
+| `logs-threats` | Confirmed/investigated threats with correlation (Layer 3 output) |
+| `logs-stats` | Processing statistics (throughput, anomaly rate, queue depth) |

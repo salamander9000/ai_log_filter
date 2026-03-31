@@ -15,147 +15,127 @@ log analysis on CPU-only hardware before investing in GPU infrastructure?"**
 ## System Architecture
 
 ```
-                    DATA SOURCES                          DOCKER STACK
-                    ────────────                          ────────────
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                     DOCKER STACK (main server)                   │
+    │                                                                 │
+    │  Kafka (mTLS) ──> AI Service ──────────────────────────────┐    │
+    │                   │ consume_kafka()                         │    │
+    │                   │ + RateLimiter                           │    │
+    │                   │                                        │    │
+    │                   ├── Layer 1: Parse + Drain3 + Isolation   │    │
+    │                   │   Forest (microseconds per event)      │    │
+    │                   │   Template allowlisting (skip noise)   │    │
+    │                   │                                        │    │
+    │                   ├── Layer 2: Async LLM workers            │    │
+    │                   │   ──> HAProxy:11434 ──> L2 Ollama pool │    │
+    │                   │   (qwen2.5:0.5b, fast)                 │    │
+    │                   │                                        │    │
+    │                   ├── high/critical ──> Redis layer3:queue  │    │
+    │                   │                                        │    │
+    │                   └──> OpenSearch (logs-processed,          │    │
+    │                        logs-anomalies, logs-stats)          │    │
+    │                                                                 │
+    │  Layer 3 Engine ──< Redis layer3:queue                          │
+    │                   │                                             │
+    │                   ├── Query prod ES (bidirectional window,      │
+    │                   │   scoped to same source IP + username)      │
+    │                   │   Fallback: query local OpenSearch          │
+    │                   │                                             │
+    │                   ├── LLM correlation analysis                  │
+    │                   │   ──> HAProxy:11435 ──> L3 Ollama pool     │
+    │                   │   (qwen2.5:3b, smarter)                    │
+    │                   │                                             │
+    │                   └──> OpenSearch (logs-threats)                │
+    │                                                                 │
+    │  OpenSearch Dashboards ──> 7-row dashboard (L3/L2/L1 sections) │
+    │  HAProxy Stats ──> :8405/stats (server health)                  │
+    └─────────────────────────────────────────────────────────────────┘
 
-                                                    ┌─────────────────┐
-  syslog-ng ──TCP/UDP:5514──────────────────────>   │ syslog-receiver  │
-  (remote servers)                                  │ (Python socket   │
-                                                    │  server)         │
-                                                    └────────┬────────┘
-                                                             │ RPUSH
-  Filebeat ──────────────────────────────────────>           │
-  (host, optional)                                           ▼
-                                                    ┌─────────────────┐
-  inject-anomalies.sh ──> /var/log/messages         │     Redis        │
-  (testing)               ──> syslog-ng ──────>     │  (in-memory      │
-                                                    │   buffer, list)  │
-                                                    └────────┬────────┘
-                                                             │ BLPOP
-              ┌──────────────────────────────────────────────┘
-              ▼
-    ┌───────────────────────────────────────────────────────────────┐
-    │                    AI SERVICE (main.py)                        │
-    │                                                               │
-    │   Main Thread                          LLM Worker Thread(s)   │
-    │   ───────────                          ────────────────────   │
-    │                                                               │
-    │   Redis BLPOP ──> Parse ──> Extract    Queue ──> Ollama API   │
-    │                   syslog    features        ──> Update doc    │
-    │                      │         │               in OpenSearch   │
-    │                      │         ▼                               │
-    │                      │   Isolation Forest                      │
-    │                      │   score + flag                          │
-    │                      │         │                               │
-    │                      │    ┌────┴────┐                         │
-    │                      │    │         │                          │
-    │                      │  normal   anomaly                      │
-    │                      │    │         │                          │
-    │                      │    │    ┌────┴────────┐                │
-    │                      │    │    │ Index with  │                │
-    │                      │    │    │ llm_analyzed│                │
-    │                      │    │    │ = false     │                │
-    │                      │    │    │             │                │
-    │                      │    │    │ Submit to   │                │
-    │                      │    │    │ LLM queue   │───────>  Queue │
-    │                      │    │    └─────────────┘                │
-    │                      │    │                                    │
-    │                      ▼    ▼                                    │
-    │               Bulk index to OpenSearch                         │
-    │               (logs-processed)                                 │
-    └───────────────────────────────────────────────────────────────┘
-              │                                        │
-              ▼                                        ▼
-    ┌───────────────────────────────────────────────────────────────┐
-    │                       OpenSearch                               │
-    │                                                               │
-    │   logs-processed    logs-anomalies         logs-stats          │
-    │   (all events)      (flagged events,       (throughput,        │
-    │                      LLM results via        anomaly rate,      │
-    │                      async update)          queue depth)       │
-    └───────────────────────┬───────────────────────────────────────┘
-                            │
-                            ▼
-    ┌───────────────────────────────────────────────────────────────┐
-    │                  OpenSearch Dashboards                         │
-    │                                                               │
-    │   TOP:    Threat Categories | Severity | Pending | Queue      │
-    │   MIDDLE: LLM Analysis Detail Table                           │
-    │   LOWER:  Events Over Time | Score Dist | Top Hosts           │
-    │   BOTTOM: Patterns | Throughput | Anomaly Rate                │
-    └───────────────────────────────────────────────────────────────┘
-
-    ┌───────────────────────────────────────────────────────────────┐
-    │                       Ollama                                   │
-    │                                                               │
-    │   Qwen3.5-0.8B (quantized, CPU inference)                      │
-    │   ~60-120 tokens/sec on modern CPUs                            │
-    │   ~2-10 seconds per event analysis                             │
-    └───────────────────────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  BARE METAL OLLAMA SERVERS                       │
+    │                                                                 │
+    │  Layer 2 pool (HAProxy :11434):                                 │
+    │    Server A (64t, NUM_PARALLEL=4) ──> qwen2.5:0.5b             │
+    │    Server B (64t, NUM_PARALLEL=4) ──> qwen2.5:0.5b             │
+    │    Server C (32t, NUM_PARALLEL=2) ──> qwen2.5:0.5b             │
+    │                                                                 │
+    │  Layer 3 pool (HAProxy :11435):                                 │
+    │    Server D (48t, NUM_PARALLEL=3) ──> qwen2.5:3b               │
+    │    Server E (48t, NUM_PARALLEL=3) ──> qwen2.5:3b               │
+    └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Component Details
 
-### 1. Syslog Receiver (`syslog-receiver/receiver.py`)
+### 1. Kafka Consumer (Primary Input)
 
-A lightweight Python socket server that accepts syslog messages and pushes
-them into Redis.
+The ai-service consumes raw syslog lines directly from a Kafka topic using
+`confluent-kafka` (C-based librdkafka wrapper for performance).
 
-**Protocols:** TCP + UDP on port 5514 (configurable)
+**Authentication:** mTLS with client certificate + key + CA certificate.
+Certificates are mounted from the `certs/` directory into the container.
 
-**How it works:**
-- TCP: Threaded server, one thread per connection. Handles RFC 5425
-  octet-counting framing. Each newline-delimited message is pushed
-  to Redis via `RPUSH`.
-- UDP: Each datagram is a single syslog message. Batches messages
-  into Redis pipelines for throughput (flushes every 100 messages or
-  500ms, whichever comes first).
-- Auto-reconnects to Redis if the connection drops.
-- Logs stats every 30 seconds (total received, errors).
+**Key configuration:**
+- `security.protocol=SSL` - mTLS authentication
+- `ssl.endpoint.identification.algorithm=none` - required when Kafka is
+  behind an HA proxy (broker cert CN doesn't match proxy hostname)
+- `ssl.key.password` - optional, for password-protected private keys
+- `auto.offset.reset=latest` - start from newest messages (not replay)
+- `enable.auto.commit=true` - offsets committed every 5 seconds
 
-**Why a separate container?** Decouples network I/O from the AI processing.
-The receiver can handle thousands of connections and burst traffic while
-Redis absorbs backpressure.
+**Rate limiting:** Token bucket algorithm limits how many events/sec pass
+to Layer 1. Excess messages are consumed from Kafka (offsets advance) but
+silently dropped. Set `RATE_LIMIT_PER_SEC=0` for unlimited.
 
-### 2. Redis (Buffer)
+**Alternative inputs (optional profiles):**
+- `INPUT_MODE=redis` + `--profile syslog` - syslog-ng -> syslog-receiver -> Redis
+- `INPUT_MODE=file` + `--profile demo` - synthetic log generator
 
-Standard Redis 7 running as a pure in-memory FIFO queue.
+### 2. Redis (Layer 3 Queue Only)
+
+Redis is used only for the L2->L3 handoff queue (`layer3:queue`).
+Input no longer goes through Redis when using Kafka.
 
 **Configuration:**
-- `maxmemory 4gb` - caps memory usage (increase if the server has ample RAM)
-- `maxmemory-policy noeviction` - returns error when full rather than
-  silently dropping messages
-- No persistence (`appendonly no`, `save ""`) - pure speed, no disk I/O
+- `maxmemory 1gb` - lightweight, only L3 queue volume
+- `maxmemory-policy noeviction` - error when full
+- No persistence - pure in-memory
 
-**How data flows:**
-- Syslog receiver and/or Filebeat push messages with `RPUSH filebeat:logs`
-- AI service consumes with `BLPOP filebeat:logs` (blocking pop)
-- Queue depth should stay near 0 during normal operation. If it grows,
-  it means the AI service is processing slower than the input rate.
+### 3. HAProxy (Ollama Load Balancer)
 
-**Why Redis?** It provides backpressure buffering. If the AI service restarts,
-crashes, or falls behind (especially during LLM analysis), messages queue
-safely in RAM rather than being lost. On servers with ample RAM, you can
-increase the Redis `maxmemory` to buffer millions of events.
+Routes LLM requests to separate server pools for Layer 2 and Layer 3.
 
-### 3. AI Service - Main Thread (`ai-service/main.py`)
+**Two backends:**
+- Port 11434 -> Layer 2 pool (fast small model, e.g. qwen2.5:0.5b)
+- Port 11435 -> Layer 3 pool (larger model, e.g. qwen2.5:3b)
+
+**Balancing:** `leastconn` - sends to server with fewest active connections.
+Ideal for LLM inference where request times vary (2-30 seconds).
+
+**Health check:** `GET /api/tags` every 10 seconds. Server marked down
+after 3 failures, back up after 2 successes.
+
+**Stats page:** `http://<server>:8405/stats` - shows per-server health,
+active connections, throughput for both L2 and L3 pools.
+
+### 4. AI Service - Main Thread (`ai-service/main.py`)
 
 The core processing pipeline. Runs as a single main thread that processes
 events sequentially, never blocking on the LLM.
 
-#### Step 1: Input (`main.py:802-868`)
+#### Step 1: Input
 
-Two input modes selected by `INPUT_MODE` env var:
+Three input modes selected by `INPUT_MODE` env var:
 
-- **`redis` (default):** Calls `BLPOP` on the Redis list with a 1-second
-  timeout. Handles both raw syslog lines and Filebeat JSON envelopes
-  (`{"message": "the syslog line", ...}`). Auto-reconnects on connection
-  failure.
+- **`kafka` (default):** Consumes from Kafka topic with mTLS. Rate-limited
+  via token bucket. Uses `confluent-kafka` for C-level performance.
 
-- **`file`:** Tails a log file from the beginning (like `tail -f` but
-  starting at byte 0). Used for demo mode with the synthetic generator.
+- **`redis`:** Calls `BLPOP` on a Redis list. Used with syslog-receiver
+  for non-Kafka environments.
+
+- **`file`:** Tails a log file. Used for demo mode with synthetic generator.
 
 #### Step 2: Syslog Parsing (`main.py:93-156`)
 
@@ -376,35 +356,57 @@ incoming events are anomalous and you receive 10 events/sec, that's ~6
 anomalies/minute. Without async, every LLM call would stall the main
 loop, causing the Redis input queue to grow and Layer 1 to fall behind.
 
-### 5. Ollama (LLM Runtime)
+### 5. Ollama Servers (Bare Metal, Not in Docker)
 
-Ollama manages the local LLM model. It handles model loading, memory
-management, and inference.
+Ollama runs on dedicated bare metal servers, not inside Docker. The servers
+are organized into two pools managed by HAProxy.
 
-**Default model:** Qwen3.5-0.8B (quantized)
-- 0.8 billion parameters
-- ~1GB disk / ~1.5GB RAM
-- ~60-120 tokens/sec on modern CPUs
-- Native structured output (JSON) and tool calling support
-- Thinking mode disabled via `/no_think` prompt suffix for speed
+**Layer 2 model:** `qwen2.5:0.5b` - 500M params, ~1 sec/event on CPU.
+Fast but limited reasoning. Used for initial threat classification.
 
-**Why this model?**
-- Small enough to run fast on CPU (~2-10 seconds per event)
-- Qwen3.5 family has strong structured output capabilities at every size
-- Much faster than 3B+ models while still providing useful classification
-- Thinking mode can be disabled to avoid wasting tokens on internal reasoning
+**Layer 3 model:** `qwen2.5:3b` - 3B params, ~5-10 sec/event on CPU.
+Better reasoning. Used for correlation analysis with full context.
 
-**Thinking mode:** Qwen3/3.5 models support a "thinking" mode that wraps
-internal reasoning in `<think>...</think>` blocks. For our use case, thinking
-wastes CPU cycles generating tokens we don't need. The prompt includes
-`/no_think` to disable this, and the response parser strips any `<think>`
-blocks as a fallback.
+**Thinking mode:** All LLM API calls include `"think": false` in the
+Ollama API request body. This is critical for models that support thinking
+mode (Qwen3/3.5, Ministral) - without it, the model spends all tokens on
+internal reasoning and produces no usable output. The response parser also
+strips any `<think>...</think>` blocks as a fallback.
 
-**Alternatives:**
-- `qwen3.5:2b` - better accuracy, ~2-3x slower
-- `qwen3.5:9b` - significantly more accurate, needs ~8GB RAM
-- `ministral-3:3b` - strong structured output, newer Mistral architecture
-- `qwen2.5:3b` - previous default, good quality but slower on CPU
+**Server configuration (systemd override):**
+```ini
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_NUM_PARALLEL=4"   # adjust per CPU count
+Environment="OLLAMA_KEEP_ALIVE=-1"    # keep model in RAM
+```
+
+### 5b. Layer 3 Correlation Engine (`layer3-engine/engine.py`)
+
+Separate service that performs threat correlation and breach detection.
+
+**Input:** Consumes from Redis `layer3:queue` (high/critical events from L2).
+
+**Correlation process:**
+1. Extract source IP and username from the trigger event
+2. Query production ES (or local OpenSearch fallback) with a **bidirectional
+   time window** (20s before, 30s after the anomaly timestamp)
+3. Queries are **scoped to the same source IP and username** to avoid
+   false correlations (e.g., root brute force won't pick up alice's normal login)
+4. Specifically searches for successful logins after failed auth attempts
+   to detect breach (brute_force_success)
+5. Sends enriched context to LLM via HAProxy L3 pool
+6. Indexes result to `logs-threats` with narrative, confidence, evidence
+
+**Breach detection example:**
+```
+T-10s: Failed password for root from 185.220.101.42  (correlated, before)
+T-5s:  Failed password for root from 185.220.101.42  (correlated, before)
+T=0:   Failed password for root from 185.220.101.42  (trigger event)
+T+15s: Accepted password for root from 185.220.101.42 (correlated, after = BREACH!)
+```
+
+**Output:** `logs-threats` index with `confirmed=true/false`, attack type,
+narrative, correlated events text, and recommended actions.
 
 ### 6. OpenSearch + Dashboards
 
